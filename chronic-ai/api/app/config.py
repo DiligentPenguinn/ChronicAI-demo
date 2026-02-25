@@ -66,6 +66,9 @@ class Settings(BaseSettings):
     openai_compatible_connect_timeout_seconds: float = 15.0
     # If a long response fails (timeout/5xx), retry once with smaller max_tokens.
     openai_compatible_fallback_max_tokens: int = 700
+    # Retries for transient upstream transport failures (e.g. incomplete chunked read).
+    openai_compatible_transport_retries: int = 2
+    openai_compatible_transport_retry_base_delay_seconds: float = 0.8
 
     # Legacy Ollama Configuration (optional fallback)
     ollama_host: str = "http://localhost:11434"

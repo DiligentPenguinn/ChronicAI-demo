@@ -21,6 +21,27 @@ def test_openai_token_candidates_single_when_fallback_matches_primary(monkeypatc
     assert llm_client_module.LLMClient._openai_compatible_token_candidates(700) == [700]
 
 
+def test_openai_transport_retries_has_safe_minimum(monkeypatch):
+    monkeypatch.setattr(
+        llm_client_module.settings,
+        "openai_compatible_transport_retries",
+        0,
+        raising=False,
+    )
+    assert llm_client_module.LLMClient._openai_compatible_transport_retries() == 1
+
+
+def test_openai_transport_retry_delay_backoff_cap(monkeypatch):
+    monkeypatch.setattr(
+        llm_client_module.settings,
+        "openai_compatible_transport_retry_base_delay_seconds",
+        1.0,
+        raising=False,
+    )
+    assert llm_client_module.LLMClient._openai_compatible_transport_retry_delay_seconds(0) == 1.0
+    assert llm_client_module.LLMClient._openai_compatible_transport_retry_delay_seconds(4) == 3.0
+
+
 def test_doctor_graph_retry_config_forces_single_attempt_with_openai_provider(monkeypatch):
     monkeypatch.setattr(doctor_graph.settings, "llm_provider", "openai_compatible", raising=False)
     monkeypatch.setattr(doctor_graph.settings, "llm_retry_max_attempts", 5, raising=False)

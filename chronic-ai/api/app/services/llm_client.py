@@ -134,79 +134,98 @@ class LLMClient:
         headers = self._openai_compatible_headers()
         token_candidates = self._openai_compatible_token_candidates(num_predict)
         fallback_mode = len(token_candidates) > 1
+        transport_retries = self._openai_compatible_transport_retries()
 
         try:
             async with httpx.AsyncClient(timeout=self._openai_compatible_timeout()) as client:
                 for idx, max_tokens in enumerate(token_candidates):
-                    try:
-                        payload = self._build_openai_compatible_payload(
-                            model=model,
-                            prompt=prompt,
-                            system=system,
-                            images=images,
-                            num_predict=max_tokens,
-                            stream=False,
-                            include_system_role=True,
-                        )
-                        response = await client.post(
-                            url,
-                            headers=headers,
-                            json=payload,
-                        )
-                        if response.status_code >= 400:
-                            error_text = self._extract_http_error(response)
-                            if response.status_code == 400 and self._is_role_alternation_error(error_text):
+                    for transport_attempt in range(transport_retries):
+                        try:
+                            payload = self._build_openai_compatible_payload(
+                                model=model,
+                                prompt=prompt,
+                                system=system,
+                                images=images,
+                                num_predict=max_tokens,
+                                stream=False,
+                                include_system_role=True,
+                            )
+                            response = await client.post(
+                                url,
+                                headers=headers,
+                                json=payload,
+                            )
+                            if response.status_code >= 400:
+                                error_text = self._extract_http_error(response)
+                                if response.status_code == 400 and self._is_role_alternation_error(error_text):
+                                    logger.warning(
+                                        "OpenAI-compatible endpoint rejected system role ordering; retrying without system role"
+                                    )
+                                    fallback_payload = self._build_openai_compatible_payload(
+                                        model=model,
+                                        prompt=prompt,
+                                        system=system,
+                                        images=images,
+                                        num_predict=max_tokens,
+                                        stream=False,
+                                        include_system_role=False,
+                                    )
+                                    response = await client.post(
+                                        url,
+                                        headers=headers,
+                                        json=fallback_payload,
+                                    )
+                                response.raise_for_status()
+                            return self._extract_vertex_text(response.json())
+                        except (httpx.TimeoutException, httpx.RemoteProtocolError, httpx.ReadError) as e:
+                            has_more_transport_retries = transport_attempt + 1 < transport_retries
+                            if has_more_transport_retries:
+                                delay = self._openai_compatible_transport_retry_delay_seconds(
+                                    transport_attempt
+                                )
                                 logger.warning(
-                                    "OpenAI-compatible endpoint rejected system role ordering; retrying without system role"
+                                    "OpenAI-compatible transport error %s at max_tokens=%d "
+                                    "(attempt %d/%d); retrying in %.1fs",
+                                    type(e).__name__,
+                                    max_tokens,
+                                    transport_attempt + 1,
+                                    transport_retries,
+                                    delay,
                                 )
-                                fallback_payload = self._build_openai_compatible_payload(
-                                    model=model,
-                                    prompt=prompt,
-                                    system=system,
-                                    images=images,
-                                    num_predict=max_tokens,
-                                    stream=False,
-                                    include_system_role=False,
+                                if delay > 0.0:
+                                    await asyncio.sleep(delay)
+                                continue
+                            if fallback_mode and idx + 1 < len(token_candidates):
+                                logger.warning(
+                                    "OpenAI-compatible call failed with %s at max_tokens=%d; retrying with max_tokens=%d",
+                                    type(e).__name__,
+                                    max_tokens,
+                                    token_candidates[idx + 1],
                                 )
-                                response = await client.post(
-                                    url,
-                                    headers=headers,
-                                    json=fallback_payload,
-                                )
-                            response.raise_for_status()
-                        return self._extract_vertex_text(response.json())
-                    except (httpx.TimeoutException, httpx.RemoteProtocolError) as e:
-                        if fallback_mode and idx + 1 < len(token_candidates):
-                            logger.warning(
-                                "OpenAI-compatible call failed with %s at max_tokens=%d; retrying with max_tokens=%d",
-                                type(e).__name__,
-                                max_tokens,
-                                token_candidates[idx + 1],
+                                break
+                            if isinstance(e, httpx.TimeoutException):
+                                raise RuntimeError("OpenAI-compatible request timed out")
+                            raise RuntimeError(
+                                f"OpenAI-compatible generation failed: {type(e).__name__}: {str(e) or 'Unknown error'}"
                             )
-                            continue
-                        if isinstance(e, httpx.TimeoutException):
-                            raise RuntimeError("OpenAI-compatible request timed out")
-                        raise RuntimeError(
-                            f"OpenAI-compatible generation failed: {type(e).__name__}: {str(e) or 'Unknown error'}"
-                        )
-                    except httpx.HTTPStatusError as e:
-                        status_code = e.response.status_code
-                        if (
-                            fallback_mode
-                            and idx + 1 < len(token_candidates)
-                            and self._is_retryable_openai_status(status_code)
-                        ):
-                            logger.warning(
-                                "OpenAI-compatible call returned %d at max_tokens=%d; retrying with max_tokens=%d",
-                                status_code,
-                                max_tokens,
-                                token_candidates[idx + 1],
+                        except httpx.HTTPStatusError as e:
+                            status_code = e.response.status_code
+                            if (
+                                fallback_mode
+                                and idx + 1 < len(token_candidates)
+                                and self._is_retryable_openai_status(status_code)
+                            ):
+                                logger.warning(
+                                    "OpenAI-compatible call returned %d at max_tokens=%d; retrying with max_tokens=%d",
+                                    status_code,
+                                    max_tokens,
+                                    token_candidates[idx + 1],
+                                )
+                                break
+                            raise RuntimeError(
+                                f"OpenAI-compatible error ({status_code}): "
+                                f"{self._extract_http_error(e.response)}"
                             )
-                            continue
-                        raise RuntimeError(
-                            f"OpenAI-compatible error ({status_code}): "
-                            f"{self._extract_http_error(e.response)}"
-                        )
                 raise RuntimeError("OpenAI-compatible generation failed before response parsing")
         except httpx.ConnectError:
             raise RuntimeError(
@@ -489,6 +508,20 @@ class LLMClient:
         if fallback_tokens < primary_tokens:
             return [primary_tokens, fallback_tokens]
         return [primary_tokens]
+
+    @staticmethod
+    def _openai_compatible_transport_retries() -> int:
+        return max(int(getattr(settings, "openai_compatible_transport_retries", 2)), 1)
+
+    @staticmethod
+    def _openai_compatible_transport_retry_delay_seconds(attempt: int) -> float:
+        base = max(
+            float(getattr(settings, "openai_compatible_transport_retry_base_delay_seconds", 0.8)),
+            0.0,
+        )
+        if base <= 0.0:
+            return 0.0
+        return min(base * (2 ** attempt), 3.0)
 
     def _build_vertex_payload(
         self,
