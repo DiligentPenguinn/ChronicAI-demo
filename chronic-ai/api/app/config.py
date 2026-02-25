@@ -12,6 +12,7 @@ except ModuleNotFoundError as e:  # pragma: no cover
     ) from e
 from typing import List, Union
 import json
+import re
 from pydantic import AliasChoices, Field, field_validator
 
 
@@ -81,6 +82,41 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("FASTAPI_PORT", "PORT"),
     )
     cors_origins: Union[str, List[str]] = ["http://localhost:3000"]
+
+    @field_validator(
+        "openai_compatible_timeout_seconds",
+        "openai_compatible_connect_timeout_seconds",
+        mode="before",
+    )
+    @classmethod
+    def parse_timeout_seconds(cls, v: object) -> float:
+        """Accept numeric values and loose range strings like '40-45'."""
+        if isinstance(v, (int, float)):
+            return float(v)
+        if not isinstance(v, str):
+            return v
+
+        raw = v.strip()
+        if not raw:
+            return v
+
+        # Handle plain numbers first.
+        try:
+            return float(raw)
+        except ValueError:
+            pass
+
+        # Accept user-entered ranges like "40-45" and pick the upper bound.
+        match = re.match(
+            r"^\s*([0-9]+(?:\.[0-9]+)?)\s*-\s*([0-9]+(?:\.[0-9]+)?)\s*$",
+            raw,
+        )
+        if match:
+            low = float(match.group(1))
+            high = float(match.group(2))
+            return max(low, high)
+
+        return v
 
     @field_validator("cors_origins", mode="before")
     @classmethod
