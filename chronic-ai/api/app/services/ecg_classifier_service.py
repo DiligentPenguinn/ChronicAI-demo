@@ -13,7 +13,8 @@ Supported auth types (via ECG_CLASSIFIER_AUTH_TYPE):
   - none:          No auth headers (local dev, VPN-protected endpoints)
   - bearer:        Static Authorization: Bearer <token>
   - api_key:       Configurable header + key (e.g. X-API-Key)
-  - vertex_gcloud: GCP access token via gcloud CLI (default, backward-compat)
+  - vertex_gcloud: Vertex access token (ADC/service account first, gcloud fallback)
+  - vertex:        Alias of vertex_gcloud
 """
 
 from __future__ import annotations
@@ -57,7 +58,7 @@ class ECGClassifierService:
         """
         Build authentication headers based on the configured auth type.
 
-        Supported types: none, bearer, api_key, vertex_gcloud.
+        Supported types: none, bearer, api_key, vertex_gcloud, vertex.
         """
         auth_type = (settings.ecg_classifier_auth_type or "vertex_gcloud").strip().lower()
 
@@ -91,7 +92,7 @@ class ECGClassifierService:
                 "Content-Type": "application/json",
             }
 
-        if auth_type == "vertex_gcloud":
+        if auth_type in {"vertex_gcloud", "vertex"}:
             from app.services.llm_client import llm_client
 
             token = await llm_client._get_vertex_access_token()
@@ -102,7 +103,7 @@ class ECGClassifierService:
 
         raise RuntimeError(
             f"Unsupported ECG_CLASSIFIER_AUTH_TYPE='{auth_type}'. "
-            "Use: none, bearer, api_key, or vertex_gcloud."
+            "Use: none, bearer, api_key, vertex_gcloud, or vertex."
         )
 
     async def predict_from_base64(self, image_base64: str) -> dict[str, Any]:
