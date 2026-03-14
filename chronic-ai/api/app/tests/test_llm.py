@@ -62,7 +62,8 @@ class TestSystemHealth:
         result = await check_system_health()
         
         assert "status" in result
-        assert "ollama" in result
+        assert "provider" in result
+        assert "llm" in result
         assert result["status"] in ["healthy", "degraded", "unhealthy"]
 
 
@@ -163,3 +164,67 @@ class TestUploadAnalysisCacheKey:
 
         assert changed_text != base
         assert changed_image != base
+
+
+class TestECGUploadAnalysis:
+    """Regression tests for the ECG-specific upload analysis branch."""
+
+    @pytest.mark.asyncio
+    async def test_ecg_analysis_accepts_adapted_classifier_payload(self, monkeypatch):
+        from app.services import llm as llm_module
+
+        async def fake_get_cached_upload_analysis(cache_key):
+            return None
+
+        async def fake_store_upload_analysis_cache(cache_key, result):
+            return None
+
+        async def fake_check_model_available(model):
+            return True
+
+        async def fake_generate(**kwargs):
+            return (
+                '{"summary":"Tóm tắt ECG","key_findings":["Bất thường ST-T"],'
+                '"clinical_significance":"Có ý nghĩa lâm sàng",'
+                '"recommended_follow_up":["Khám tim mạch"],'
+                '"urgency":"medium","confidence":"high","limitations":["Dựa trên ảnh tải lên"]}'
+            )
+
+        async def fake_predict_from_base64(image_base64):
+            return {
+                "classifier_type": "medsiglip_similarity",
+                "checkpoint_path": "remote-score-endpoint",
+                "medsiglip_model_id": "google/medsiglip-448",
+                "classes": ["NORM", "MI", "STTC", "CD", "HYP"],
+                "scores": [0.12, 0.21, 0.83, 0.34, 0.45],
+                "scores_by_class": {
+                    "NORM": 0.12,
+                    "MI": 0.21,
+                    "STTC": 0.83,
+                    "CD": 0.34,
+                    "HYP": 0.45,
+                },
+                "predicted_labels": ["STTC"],
+                "threshold": 0.5,
+            }
+
+        monkeypatch.setattr(llm_module, "_get_cached_upload_analysis", fake_get_cached_upload_analysis)
+        monkeypatch.setattr(llm_module, "_store_upload_analysis_cache", fake_store_upload_analysis_cache)
+        monkeypatch.setattr(llm_module.llm_client, "check_model_available", fake_check_model_available)
+        monkeypatch.setattr(llm_module.llm_client, "generate", fake_generate)
+        monkeypatch.setattr(llm_module.llm_client, "unload", fake_check_model_available)
+        monkeypatch.setattr(llm_module.ecg_classifier_service, "predict_from_base64", fake_predict_from_base64)
+
+        result = await llm_module.analyze_uploaded_record(
+            record_type="ecg",
+            title="ECG",
+            extracted_text=None,
+            image_base64="ZmFrZS1pbWFnZQ==",
+        )
+
+        assert result["status"] == "completed"
+        assert result["summary"] == "Tóm tắt ECG"
+        assert result["prediction_scores"][2]["class"] == "STTC"
+        assert result["prediction_scores"][2]["score"] == 0.83
+        assert result["ecg_classifier"]["classifier_type"] == "medsiglip_similarity"
+        assert result["ecg_classifier"]["predicted_labels"] == ["STTC"]

@@ -19,7 +19,7 @@ Supported auth types (via ECG_CLASSIFIER_AUTH_TYPE):
 
 from __future__ import annotations
 
-import json
+import base64
 import logging
 import time
 from typing import Any
@@ -29,6 +29,15 @@ import httpx
 from app.config import settings
 
 logger = logging.getLogger(__name__)
+
+ECG_LABEL_PROMPTS: list[tuple[str, str]] = [
+    ("NORM", "12-lead ECG showing normal sinus rhythm and otherwise normal ECG findings"),
+    ("MI", "12-lead ECG showing myocardial infarction pattern or infarction-related changes"),
+    ("STTC", "12-lead ECG showing ST segment or T wave change abnormalities"),
+    ("CD", "12-lead ECG showing conduction disturbance or bundle branch conduction abnormality"),
+    ("HYP", "12-lead ECG showing cardiac chamber hypertrophy or strain pattern"),
+]
+DEFAULT_SCORE_THRESHOLD = 0.5
 
 
 class ECGClassifierService:
@@ -53,6 +62,75 @@ class ECGClassifierService:
                 "Set ECG_CLASSIFIER_ENDPOINT_URL in your environment."
             )
         return url
+
+    def _get_score_url(self) -> str:
+        """Resolve the configured endpoint into a concrete remote /score URL."""
+        base_url = self._get_endpoint_url().rstrip("/")
+        if base_url.endswith("/score"):
+            return base_url
+        return f"{base_url}/score"
+
+    def _decode_image_base64(self, image_base64: str) -> bytes:
+        payload = (image_base64 or "").strip()
+        if not payload:
+            raise RuntimeError("ECG image payload is empty.")
+        if payload.startswith("data:") and "," in payload:
+            payload = payload.split(",", 1)[1]
+        try:
+            return base64.b64decode(payload)
+        except Exception as exc:
+            raise RuntimeError(f"Invalid ECG image payload: {exc}") from exc
+
+    def _build_score_request_data(self) -> list[tuple[str, str]]:
+        data: list[tuple[str, str]] = [("normalize", "true")]
+        for _, prompt in ECG_LABEL_PROMPTS:
+            data.append(("texts", prompt))
+        return data
+
+    def _normalize_score_response(self, result: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(result, dict):
+            raise RuntimeError("ECG classifier endpoint returned a non-object response.")
+
+        raw_scores = result.get("scores")
+        if not isinstance(raw_scores, list) or not raw_scores:
+            raise RuntimeError("ECG classifier endpoint returned missing or empty scores.")
+
+        first_row = raw_scores[0]
+        if not isinstance(first_row, list) or not first_row:
+            raise RuntimeError("ECG classifier endpoint returned an empty score row.")
+
+        classes = [label for label, _ in ECG_LABEL_PROMPTS]
+        if len(first_row) != len(classes):
+            raise RuntimeError(
+                "ECG classifier endpoint returned wrong score vector length: "
+                f"expected={len(classes)} got={len(first_row)}"
+            )
+
+        try:
+            scores = [float(value) for value in first_row]
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "ECG classifier endpoint returned non-numeric scores."
+            ) from exc
+
+        scores_by_class = {
+            label: score for label, score in zip(classes, scores)
+        }
+        predicted_labels = [
+            label for label, score in zip(classes, scores)
+            if score >= DEFAULT_SCORE_THRESHOLD
+        ]
+
+        return {
+            "classifier_type": "medsiglip_similarity",
+            "checkpoint_path": "remote-score-endpoint",
+            "medsiglip_model_id": str(result.get("model") or ""),
+            "classes": classes,
+            "scores": scores,
+            "scores_by_class": scores_by_class,
+            "predicted_labels": predicted_labels,
+            "threshold": DEFAULT_SCORE_THRESHOLD,
+        }
 
     async def _get_auth_headers(self) -> dict[str, str]:
         """
@@ -108,7 +186,8 @@ class ECGClassifierService:
 
     async def predict_from_base64(self, image_base64: str) -> dict[str, Any]:
         """
-        Call the remote ECG classifier endpoint and return per-class scores.
+        Call the remote MedSigLIP /score endpoint and adapt similarities into
+        the historical ECG classifier payload shape.
 
         The response format matches the previous local implementation so that
         downstream code in llm.py requires no changes.
@@ -119,25 +198,23 @@ class ECGClassifierService:
             len(image_base64 or ""),
         )
 
-        endpoint_url = self._get_endpoint_url()
-
-        # Build request payload
-        request_body = {"image_base64": image_base64}
-
-        # Check if endpoint uses Vertex AI prediction format
-        # (wraps payload in {"instances": [...]})
-        is_vertex_predict = endpoint_url.rstrip("/").endswith(":predict")
-        if is_vertex_predict:
-            request_body = {"instances": [request_body]}
+        endpoint_url = self._get_score_url()
+        image_bytes = self._decode_image_base64(image_base64)
+        files = [
+            ("files", ("ecg-upload.png", image_bytes, "image/png")),
+        ]
+        request_data = self._build_score_request_data()
 
         try:
             headers = await self._get_auth_headers()
+            headers.pop("Content-Type", None)
 
             async with httpx.AsyncClient(timeout=self._timeout) as client:
                 response = await client.post(
                     endpoint_url,
                     headers=headers,
-                    json=request_body,
+                    data=request_data,
+                    files=files,
                 )
                 response.raise_for_status()
                 result = response.json()
@@ -158,48 +235,19 @@ class ECGClassifierService:
                 f"ECG classifier endpoint error ({exc.response.status_code}): {error_detail}"
             )
 
-        # Parse response — handle both direct and Vertex AI prediction wrapper formats
-        prediction = result
-        if "predictions" in result and isinstance(result["predictions"], list):
-            # Vertex AI wraps the response: {"predictions": [{...}]}
-            predictions = result["predictions"]
-            if predictions:
-                prediction = predictions[0]
-            else:
-                raise RuntimeError("ECG classifier endpoint returned empty predictions.")
-
-        # Extract fields (matching the format from serve.py)
-        classes = [str(c) for c in prediction.get("classes", [])]
-        scores = [float(s) for s in prediction.get("scores", [])]
-        scores_by_class = {
-            str(k): float(v)
-            for k, v in prediction.get("scores_by_class", {}).items()
-        }
-        predicted_labels = [str(l) for l in prediction.get("predicted_labels", [])]
-        threshold = float(prediction.get("threshold", 0.5))
-        classifier_type = str(prediction.get("classifier_type", ""))
-        medsiglip_model_id = str(prediction.get("medsiglip_model_id", ""))
+        prediction = self._normalize_score_response(result)
 
         elapsed_ms = (time.perf_counter() - start_total) * 1000
         logger.info(
             "[ecg-classifier] predict complete (remote) classifier_type=%s predicted=%s "
             "top3=%s elapsed_ms=%.1f",
-            classifier_type,
-            predicted_labels,
-            sorted(scores_by_class.items(), key=lambda x: x[1], reverse=True)[:3],
+            prediction["classifier_type"],
+            prediction["predicted_labels"],
+            sorted(prediction["scores_by_class"].items(), key=lambda x: x[1], reverse=True)[:3],
             elapsed_ms,
         )
 
-        return {
-            "classifier_type": classifier_type,
-            "checkpoint_path": "vertex-ai-endpoint",
-            "medsiglip_model_id": medsiglip_model_id,
-            "classes": classes,
-            "scores": scores,
-            "scores_by_class": scores_by_class,
-            "predicted_labels": predicted_labels,
-            "threshold": threshold,
-        }
+        return prediction
 
 
 ecg_classifier_service = ECGClassifierService()
