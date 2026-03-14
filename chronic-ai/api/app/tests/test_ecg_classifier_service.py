@@ -128,11 +128,11 @@ class TestAuthHeaders:
 
 
 class _MockResponse:
-    def __init__(self, payload, status_code=200, text=""):
+    def __init__(self, payload, status_code=200, text="", request_url="https://example.test/score"):
         self._payload = payload
         self.status_code = status_code
         self.text = text
-        self.request = httpx.Request("POST", "https://example.test/score")
+        self.request = httpx.Request("POST", request_url)
 
     def raise_for_status(self):
         if self.status_code >= 400:
@@ -162,9 +162,18 @@ class _MockAsyncClient:
         return False
 
     async def post(self, url, **kwargs):
+        self._recorder.setdefault("calls", []).append({"url": url, "kwargs": kwargs})
         self._recorder["url"] = url
         self._recorder["kwargs"] = kwargs
-        return _MockResponse(self._response_payload)
+
+        if callable(self._response_payload):
+            response = self._response_payload(url, kwargs)
+        else:
+            response = self._response_payload
+
+        if isinstance(response, _MockResponse):
+            return response
+        return _MockResponse(response, request_url=url)
 
 
 class TestPredictFromBase64:
@@ -181,7 +190,7 @@ class TestPredictFromBase64:
         }
 
         with patch("app.services.ecg_classifier_service.settings") as ms:
-            ms.ecg_classifier_endpoint_url = "https://example.test/api"
+            ms.ecg_classifier_endpoint_url = "https://example.test/api/score"
             with patch.object(service, "_get_auth_headers", AsyncMock(return_value={"Authorization": "Bearer token", "Content-Type": "application/json"})):
                 with patch(
                     "app.services.ecg_classifier_service.httpx.AsyncClient",
@@ -228,12 +237,82 @@ class TestPredictFromBase64:
         assert recorder["url"] == "https://example.test/custom/score"
 
     @pytest.mark.asyncio
+    async def test_predict_from_base64_supports_explicit_predict_endpoint(self, service):
+        recorder = {}
+        image_base64 = base64.b64encode(b"img").decode("ascii")
+        remote_payload = {
+            "classifier_type": "moe",
+            "checkpoint_path": "vertex-endpoint",
+            "medsiglip_model_id": "google/medsiglip-448",
+            "classes": [label for label, _ in ECG_LABEL_PROMPTS],
+            "scores": [0.1, 0.2, 0.8, 0.4, 0.5],
+            "predicted_labels": ["STTC", "HYP"],
+            "threshold": 0.5,
+        }
+
+        with patch("app.services.ecg_classifier_service.settings") as ms:
+            ms.ecg_classifier_endpoint_url = "https://example.test/predict"
+            with patch.object(service, "_get_auth_headers", AsyncMock(return_value={"Authorization": "Bearer token", "Content-Type": "application/json"})):
+                with patch(
+                    "app.services.ecg_classifier_service.httpx.AsyncClient",
+                    return_value=_MockAsyncClient(remote_payload, recorder),
+                ):
+                    result = await service.predict_from_base64(image_base64)
+
+        assert recorder["url"] == "https://example.test/predict"
+        assert recorder["kwargs"]["headers"]["Content-Type"] == "application/json"
+        assert recorder["kwargs"]["json"] == {"image_base64": image_base64}
+        assert "files" not in recorder["kwargs"]
+        assert result["classifier_type"] == "moe"
+        assert result["checkpoint_path"] == "vertex-endpoint"
+        assert result["scores"] == remote_payload["scores"]
+        assert result["predicted_labels"] == ["STTC", "HYP"]
+
+    @pytest.mark.asyncio
+    async def test_predict_from_base64_tries_predict_then_falls_back_to_score(self, service):
+        recorder = {}
+        image_bytes = b"fake-png-data"
+        image_base64 = base64.b64encode(image_bytes).decode("ascii")
+        remote_payload = {
+            "model": "google/medsiglip-448",
+            "scores": [[0.91, 0.22, 0.61, 0.49, 0.85]],
+        }
+
+        def responder(url, kwargs):
+            if url.endswith("/predict"):
+                return _MockResponse(
+                    {"detail": "not found"},
+                    status_code=404,
+                    text="not found",
+                    request_url=url,
+                )
+            return _MockResponse(remote_payload, request_url=url)
+
+        with patch("app.services.ecg_classifier_service.settings") as ms:
+            ms.ecg_classifier_endpoint_url = "https://example.test/base"
+            with patch.object(service, "_get_auth_headers", AsyncMock(return_value={"Authorization": "Bearer token", "Content-Type": "application/json"})):
+                with patch(
+                    "app.services.ecg_classifier_service.httpx.AsyncClient",
+                    return_value=_MockAsyncClient(responder, recorder),
+                ):
+                    result = await service.predict_from_base64(image_base64)
+
+        assert [call["url"] for call in recorder["calls"]] == [
+            "https://example.test/base/predict",
+            "https://example.test/base/score",
+        ]
+        assert recorder["calls"][0]["kwargs"]["json"] == {"image_base64": image_base64}
+        uploaded_file = recorder["calls"][1]["kwargs"]["files"][0]
+        assert uploaded_file[1][1] == image_bytes
+        assert result["predicted_labels"] == ["NORM", "STTC", "HYP"]
+
+    @pytest.mark.asyncio
     async def test_predict_from_base64_rejects_wrong_score_vector_length(self, service):
         image_base64 = base64.b64encode(b"img").decode("ascii")
         remote_payload = {"model": "m", "scores": [[0.1, 0.2]]}
 
         with patch("app.services.ecg_classifier_service.settings") as ms:
-            ms.ecg_classifier_endpoint_url = "https://example.test"
+            ms.ecg_classifier_endpoint_url = "https://example.test/score"
             with patch.object(service, "_get_auth_headers", AsyncMock(return_value={})):
                 with patch(
                     "app.services.ecg_classifier_service.httpx.AsyncClient",
@@ -248,7 +327,7 @@ class TestPredictFromBase64:
         remote_payload = {"model": "m", "scores": [["bad", 0.2, 0.3, 0.4, 0.5]]}
 
         with patch("app.services.ecg_classifier_service.settings") as ms:
-            ms.ecg_classifier_endpoint_url = "https://example.test"
+            ms.ecg_classifier_endpoint_url = "https://example.test/score"
             with patch.object(service, "_get_auth_headers", AsyncMock(return_value={})):
                 with patch(
                     "app.services.ecg_classifier_service.httpx.AsyncClient",
