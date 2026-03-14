@@ -192,9 +192,9 @@ class TestPredictFromBase64:
         expected_classes = [label for label, _ in ECG_LABEL_PROMPTS]
         assert recorder["url"] == "https://example.test/api/score"
         assert recorder["kwargs"]["headers"] == {"Authorization": "Bearer token"}
-        assert recorder["kwargs"]["data"][0] == ("normalize", "true")
-        assert recorder["kwargs"]["data"][1:] == [
-            ("texts", prompt) for _, prompt in ECG_LABEL_PROMPTS
+        assert recorder["kwargs"]["data"]["normalize"] == "true"
+        assert recorder["kwargs"]["data"]["texts"] == [
+            prompt for _, prompt in ECG_LABEL_PROMPTS
         ]
         uploaded_file = recorder["kwargs"]["files"][0]
         assert uploaded_file[0] == "files"
@@ -256,3 +256,13 @@ class TestPredictFromBase64:
                 ):
                     with pytest.raises(RuntimeError, match="non-numeric scores"):
                         await service.predict_from_base64(image_base64)
+
+    def test_build_score_request_data_is_async_safe_for_httpx_multipart(self, service):
+        request = httpx.AsyncClient().build_request(
+            "POST",
+            "https://example.test/score",
+            data=service._build_score_request_data(),
+            files={"files": ("ecg-upload.png", b"img", "image/png")},
+        )
+
+        assert isinstance(request.stream, httpx._multipart.MultipartStream)

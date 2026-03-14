@@ -81,11 +81,11 @@ class ECGClassifierService:
         except Exception as exc:
             raise RuntimeError(f"Invalid ECG image payload: {exc}") from exc
 
-    def _build_score_request_data(self) -> list[tuple[str, str]]:
-        data: list[tuple[str, str]] = [("normalize", "true")]
-        for _, prompt in ECG_LABEL_PROMPTS:
-            data.append(("texts", prompt))
-        return data
+    def _build_score_request_data(self) -> dict[str, str | list[str]]:
+        return {
+            "normalize": "true",
+            "texts": [prompt for _, prompt in ECG_LABEL_PROMPTS],
+        }
 
     def _normalize_score_response(self, result: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(result, dict):
