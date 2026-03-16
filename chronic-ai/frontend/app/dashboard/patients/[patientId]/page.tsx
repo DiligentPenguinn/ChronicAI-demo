@@ -3054,7 +3054,7 @@ export default function PatientDetailPage() {
                     }
                 }}
             >
-                <DialogContent className="sm:max-w-lg">
+                <DialogContent className="sm:max-w-2xl">
                     <DialogHeader>
                         <DialogTitle>{uiText.postUploadDialogTitle}</DialogTitle>
                     </DialogHeader>

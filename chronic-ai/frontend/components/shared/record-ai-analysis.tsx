@@ -24,6 +24,8 @@ const UI_TEXT: Record<
         urgencyHigh: string
         urgencyMedium: string
         urgencyLow: string
+        keyFindings: string
+        clinicalSignificance: string
         recommendedFollowUp: string
         ecgScores: string
         limitations: string
@@ -35,6 +37,8 @@ const UI_TEXT: Record<
         urgencyHigh: "Mức độ khẩn: Cao",
         urgencyMedium: "Mức độ khẩn: Trung bình",
         urgencyLow: "Mức độ khẩn: Thấp",
+        keyFindings: "Điểm chính",
+        clinicalSignificance: "Ý nghĩa lâm sàng",
         recommendedFollowUp: "Đề xuất theo dõi",
         ecgScores: "Điểm dự đoán ECG",
         limitations: "Giới hạn",
@@ -45,6 +49,8 @@ const UI_TEXT: Record<
         urgencyHigh: "Urgency: High",
         urgencyMedium: "Urgency: Medium",
         urgencyLow: "Urgency: Low",
+        keyFindings: "Key findings",
+        clinicalSignificance: "Clinical significance",
         recommendedFollowUp: "Recommended Follow-up",
         ecgScores: "ECG classifier scores",
         limitations: "Limitations",
@@ -81,10 +87,48 @@ function normalizeList(value: unknown, maxItems = 5): string[] {
     return []
 }
 
+function stripMarkdownCodeFence(value: string): string {
+    const trimmed = value.trim()
+    const fencedMatch = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i)
+    if (fencedMatch) {
+        return fencedMatch[1].trim()
+    }
+    return trimmed
+}
+
+function tryParseAnalysisObject(value: string): MedicalRecordAIAnalysis | null {
+    const normalized = stripMarkdownCodeFence(value)
+    const candidates = [normalized]
+
+    const firstBraceIndex = normalized.indexOf("{")
+    const lastBraceIndex = normalized.lastIndexOf("}")
+    if (firstBraceIndex >= 0 && lastBraceIndex > firstBraceIndex) {
+        candidates.push(normalized.slice(firstBraceIndex, lastBraceIndex + 1).trim())
+    }
+
+    for (const candidate of candidates) {
+        if (!candidate) continue
+        try {
+            const parsed = JSON.parse(candidate)
+            if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+                return parsed as MedicalRecordAIAnalysis
+            }
+        } catch {
+            continue
+        }
+    }
+
+    return null
+}
+
 function normalizeAnalysis(analysis?: MedicalRecordAIAnalysis | string | null): MedicalRecordAIAnalysis | null {
     if (!analysis) return null
     if (typeof analysis === "string") {
-        const summary = analysis.trim()
+        const parsed = tryParseAnalysisObject(analysis)
+        if (parsed) {
+            return parsed
+        }
+        const summary = stripMarkdownCodeFence(analysis)
         return summary ? { summary, status: "completed" } : null
     }
     return analysis
@@ -167,6 +211,16 @@ function getUrgencyBadgeVariant(urgency?: string): "outline" | "secondary" | "de
     return "outline"
 }
 
+function shouldRenderPredictionScoresAsPercent(rows: PredictionScoreRow[]): boolean {
+    return rows.length > 0 && rows.every((row) => row.score >= 0 && row.score <= 1)
+}
+
+function formatPredictionScore(score: number, usePercent: boolean): string {
+    return usePercent
+        ? `${(score * 100).toFixed(1)}%`
+        : score.toFixed(3)
+}
+
 export function RecordDoctorComment({ doctorComment }: RecordDoctorCommentProps) {
     const { language } = useDashboardLanguage()
     const t = UI_TEXT[language]
@@ -192,13 +246,19 @@ export function RecordAIAnalysis({ analysis }: RecordAIAnalysisProps) {
 
     const summary = parsed && typeof parsed.summary === "string" ? parsed.summary.trim() : ""
     const keyFindings = parsed ? normalizeList(parsed.key_findings) : []
+    const clinicalSignificance =
+        parsed && typeof parsed.clinical_significance === "string"
+            ? parsed.clinical_significance.trim()
+            : ""
     const followUp = parsed ? normalizeList(parsed.recommended_follow_up) : []
     const limitations = parsed ? normalizeList(parsed.limitations) : []
     const predictionScores = parsed ? normalizePredictionScores(parsed, language) : []
+    const renderScoresAsPercent = shouldRenderPredictionScoresAsPercent(predictionScores)
 
     if (
         !summary
         && keyFindings.length === 0
+        && !clinicalSignificance
         && followUp.length === 0
         && limitations.length === 0
         && predictionScores.length === 0
@@ -227,11 +287,25 @@ export function RecordAIAnalysis({ analysis }: RecordAIAnalysisProps) {
             )}
 
             {keyFindings.length > 0 && (
-                <ul className="mt-2 list-disc space-y-1 pl-5 text-sm text-muted-foreground">
-                    {keyFindings.map((item, index) => (
-                        <li key={`${item}-${index}`}>{item}</li>
-                    ))}
-                </ul>
+                <div className="mt-3">
+                    <p className="text-xs font-medium uppercase tracking-wide text-foreground/80">
+                        {t.keyFindings}
+                    </p>
+                    <ul className="mt-1 list-disc space-y-1 pl-5 text-sm text-muted-foreground">
+                        {keyFindings.map((item, index) => (
+                            <li key={`${item}-${index}`}>{item}</li>
+                        ))}
+                    </ul>
+                </div>
+            )}
+
+            {clinicalSignificance && (
+                <div className="mt-3 rounded-md border border-dashed bg-background/80 p-2">
+                    <p className="text-xs font-medium text-foreground">{t.clinicalSignificance}</p>
+                    <p className="mt-1 text-xs leading-5 text-muted-foreground whitespace-pre-line">
+                        {clinicalSignificance}
+                    </p>
+                </div>
             )}
 
             {followUp.length > 0 && (
@@ -256,7 +330,7 @@ export function RecordAIAnalysis({ analysis }: RecordAIAnalysisProps) {
                                     {row.description ? ` - ${row.description}` : ""}
                                 </span>
                                 <span className="font-medium text-foreground">
-                                    {(row.score * 100).toFixed(1)}%
+                                    {formatPredictionScore(row.score, renderScoresAsPercent)}
                                 </span>
                             </li>
                         ))}
