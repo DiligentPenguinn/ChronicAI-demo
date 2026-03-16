@@ -8,10 +8,10 @@ matching the database schema defined in setup_db.sql.
 from datetime import date, datetime
 from decimal import Decimal
 from enum import Enum
-from typing import Optional
+from typing import Any, Literal, Optional
 from uuid import UUID
 
-from pydantic import BaseModel, EmailStr, Field, ConfigDict
+from pydantic import BaseModel, EmailStr, Field, ConfigDict, field_validator
 
 
 # ============================================
@@ -526,17 +526,156 @@ class VitalSignsResponse(VitalSignsBase):
 
 
 # ============================================
+# AI ANALYSIS MODELS
+# ============================================
+
+class ECGPredictionScore(BaseModel):
+    """Structured ECG classifier score for UI display."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    class_name: str = Field(..., alias="class", min_length=1, max_length=32)
+    description: Optional[str] = Field(None, max_length=200)
+    score: float = Field(..., ge=0.0, le=1.0)
+
+    @field_validator("class_name", "description", mode="before")
+    @classmethod
+    def _normalize_optional_text(cls, value):
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
+
+
+class ECGClassifierDetails(BaseModel):
+    """Diagnostic metadata from the ECG classifier service."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    classifier_type: Optional[str] = Field(None, max_length=100)
+    checkpoint_path: Optional[str] = Field(None, max_length=255)
+    medsiglip_model_id: Optional[str] = Field(None, max_length=255)
+    classes: list[str] = Field(default_factory=list)
+    scores: list[float] = Field(default_factory=list)
+    display_scores: list[float] = Field(default_factory=list)
+    scores_by_class: dict[str, float] = Field(default_factory=dict)
+    predicted_labels: list[str] = Field(default_factory=list)
+    threshold: Optional[float] = Field(None, ge=0.0)
+
+    @field_validator(
+        "classifier_type",
+        "checkpoint_path",
+        "medsiglip_model_id",
+        mode="before",
+    )
+    @classmethod
+    def _normalize_text_fields(cls, value):
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
+
+    @field_validator("classes", "predicted_labels", mode="before")
+    @classmethod
+    def _normalize_string_lists(cls, value):
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            value = [value]
+        return [str(item).strip() for item in value if str(item).strip()]
+
+    @field_validator("display_scores")
+    @classmethod
+    def _validate_display_scores(cls, value):
+        if any(score < 0.0 or score > 1.0 for score in value):
+            raise ValueError("display_scores must be between 0 and 1")
+        return value
+
+
+class MedicalRecordAIAnalysis(BaseModel):
+    """Validated AI analysis payload stored with a medical record."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    status: Optional[Literal["completed", "skipped", "error"]] = None
+    summary: Optional[str] = Field(None, max_length=1200)
+    key_findings: list[str] = Field(default_factory=list)
+    clinical_significance: Optional[str] = Field(None, max_length=1200)
+    recommended_follow_up: list[str] = Field(default_factory=list)
+    urgency: Optional[Literal["low", "medium", "high"]] = None
+    confidence: Optional[Literal["low", "medium", "high"]] = None
+    limitations: list[str] = Field(default_factory=list)
+    prediction_scores: list[ECGPredictionScore] = Field(default_factory=list)
+    ecg_classifier: Optional[ECGClassifierDetails] = None
+    model: Optional[str] = Field(None, max_length=255)
+    record_type: Optional[str] = Field(None, max_length=50)
+    generated_at: Optional[datetime] = None
+    request_id: Optional[str] = Field(None, max_length=64)
+    doctor_comment: Optional[str] = Field(None, max_length=2000)
+
+    @field_validator(
+        "summary",
+        "clinical_significance",
+        "model",
+        "record_type",
+        "request_id",
+        "doctor_comment",
+        mode="before",
+    )
+    @classmethod
+    def _normalize_scalar_text(cls, value):
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
+
+    @field_validator("key_findings", "recommended_follow_up", "limitations", mode="before")
+    @classmethod
+    def _normalize_text_lists(cls, value):
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            value = [value]
+        return [str(item).strip() for item in value if str(item).strip()]
+
+
+# ============================================
 # MEDICAL RECORD MODELS
 # ============================================
 
 class MedicalRecordBase(BaseModel):
     """Base medical record model."""
+
+    model_config = ConfigDict(from_attributes=True)
+
     record_type: RecordType
     title: Optional[str] = Field(None, max_length=255)
     content_text: Optional[str] = None
     image_path: Optional[str] = Field(None, max_length=500)
-    analysis_result: Optional[dict] = None
+    analysis_result: Optional[MedicalRecordAIAnalysis | str] = None
     doctor_comment: Optional[str] = None
+
+    @field_validator("analysis_result", mode="before")
+    @classmethod
+    def _validate_analysis_result(cls, value: Any):
+        if value is None:
+            return None
+        if isinstance(value, MedicalRecordAIAnalysis):
+            return value
+        if isinstance(value, dict):
+            return MedicalRecordAIAnalysis.model_validate(value)
+        if isinstance(value, str):
+            text = value.strip()
+            return text or None
+        raise TypeError("analysis_result must be a validated AI analysis object or non-empty string")
+
+    @field_validator("doctor_comment", mode="before")
+    @classmethod
+    def _normalize_doctor_comment(cls, value: Any):
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
 
 
 class MedicalRecordCreate(MedicalRecordBase):
@@ -547,8 +686,7 @@ class MedicalRecordCreate(MedicalRecordBase):
 
 class MedicalRecordResponse(MedicalRecordBase):
     """Model for medical record responses."""
-    model_config = ConfigDict(from_attributes=True)
-    
+
     id: UUID
     patient_id: UUID
     doctor_id: Optional[UUID] = None

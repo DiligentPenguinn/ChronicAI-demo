@@ -15,11 +15,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 import uuid
 
+from pydantic import ValidationError
+
 from app.services.ecg_classifier_service import ecg_classifier_service
 from app.services.cache import cache_response, get_cached_response, response_cache
 from app.services.llm_client import llm_client
 from app.services.rag import get_patient_context
 from app.config import settings
+from app.models.schemas import MedicalRecordAIAnalysis
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +53,7 @@ UPLOAD_ANALYSIS_SYSTEM = """You are a clinical decision-support assistant for do
 Analyze uploaded medical records and produce concise, practical insights.
 You must return valid JSON only (no markdown or extra commentary)."""
 
-UPLOAD_ANALYSIS_CACHE_TYPE = "upload_analysis:v2"
+UPLOAD_ANALYSIS_CACHE_TYPE = "upload_analysis:v4"
 
 
 def _resolve_upload_analysis_model(*, has_image: bool) -> str:
@@ -217,6 +220,40 @@ def _extract_plain_text_summary(raw_text: str) -> str:
     return _sanitize_text(cleaned, max_len=500)
 
 
+def _looks_like_garbled_summary(text: str) -> bool:
+    """
+    Detect low-quality raw model text that should not be shown as a summary.
+
+    This is only used for fallback plain-text extraction when the model failed
+    to return valid JSON. The goal is to avoid surfacing token soup such as
+    repeated numbers/connectors ("25, and, and, and") in the UI.
+    """
+    normalized = re.sub(r"\s+", " ", str(text or "").strip().lower())
+    if not normalized:
+        return True
+
+    tokens = re.findall(r"[a-zA-ZÀ-Ỵà-ỵ0-9]+", normalized)
+    if len(tokens) < 6:
+        return False
+
+    unique_ratio = len(set(tokens)) / len(tokens)
+    top_token_count = max(tokens.count(token) for token in set(tokens))
+    repeated_bigrams = 0
+    seen_bigrams: set[tuple[str, str]] = set()
+    for idx in range(len(tokens) - 1):
+        bigram = (tokens[idx], tokens[idx + 1])
+        if bigram in seen_bigrams:
+            repeated_bigrams += 1
+        else:
+            seen_bigrams.add(bigram)
+
+    return (
+        unique_ratio < 0.35
+        or top_token_count >= max(5, math.ceil(len(tokens) * 0.3))
+        or repeated_bigrams >= max(3, math.ceil((len(tokens) - 1) * 0.25))
+    )
+
+
 def _resolve_upload_analysis_summary(
     parsed: dict[str, Any],
     raw_text: str,
@@ -228,10 +265,40 @@ def _resolve_upload_analysis_summary(
         return summary
 
     fallback_summary = _extract_plain_text_summary(raw_text)
-    if fallback_summary:
+    if fallback_summary and not _looks_like_garbled_summary(fallback_summary):
         return fallback_summary
 
     return fallback_message
+
+
+def _validated_upload_analysis_result(
+    result: dict[str, Any],
+    *,
+    fallback_message: str,
+) -> dict[str, Any]:
+    """Validate a structured upload-analysis payload before caching or returning it."""
+    try:
+        validated = MedicalRecordAIAnalysis.model_validate(result)
+        return validated.model_dump(mode="json", by_alias=True, exclude_none=True)
+    except ValidationError as exc:
+        logger.warning(
+            "[upload-analysis] structured payload validation failed request_id=%s errors=%s",
+            result.get("request_id"),
+            exc.errors(),
+        )
+        fallback_result = {
+            "model": result.get("model"),
+            "record_type": result.get("record_type"),
+            "generated_at": result.get("generated_at"),
+            "request_id": result.get("request_id"),
+            "status": "error",
+            "summary": fallback_message,
+            "key_findings": [],
+            "recommended_follow_up": [],
+            "limitations": ["Structured AI output validation failed."],
+        }
+        validated = MedicalRecordAIAnalysis.model_validate(fallback_result)
+        return validated.model_dump(mode="json", by_alias=True, exclude_none=True)
 
 
 def _scores_are_probability_like(scores: list[float]) -> bool:
@@ -484,7 +551,11 @@ def _decode_cached_upload_analysis(payload: str) -> Optional[dict[str, Any]]:
         return None
     if not isinstance(data, dict):
         return None
-    return data
+    try:
+        validated = MedicalRecordAIAnalysis.model_validate(data)
+    except ValidationError:
+        return None
+    return validated.model_dump(mode="json", by_alias=True, exclude_none=True)
 
 
 async def _get_cached_upload_analysis(cache_key: str) -> Optional[dict[str, Any]]:
@@ -686,7 +757,7 @@ Rules:
         total_elapsed_ms,
     )
 
-    return {
+    return _validated_upload_analysis_result({
         **base_result,
         "status": "completed",
         "summary": summary,
@@ -711,7 +782,7 @@ Rules:
             ],
             "threshold": float(classifier_output.get("threshold", 0.5)),
         },
-    }
+    }, fallback_message="Không thể tạo AI analysis.")
 
 
 async def analyze_uploaded_record(
@@ -812,6 +883,10 @@ async def analyze_uploaded_record(
             "recommended_follow_up": [],
             "limitations": ["No OCR text or image content was available."],
         }
+        result = _validated_upload_analysis_result(
+            result,
+            fallback_message="No extractable content found for AI analysis.",
+        )
         await _store_upload_analysis_cache(cache_key, result)
         return result
 
@@ -852,14 +927,14 @@ Rules:
             settings.llm_provider,
             analysis_model
         )
-        return {
+        return _validated_upload_analysis_result({
             **base_result,
             "status": "error",
             "summary": "AI analysis model is unavailable on this server.",
             "key_findings": [],
             "recommended_follow_up": [],
             "limitations": [f"Model not available: {analysis_model}"],
-        }
+        }, fallback_message="AI analysis model is unavailable on this server.")
 
     images = [image_base64] if image_base64 else None
 
@@ -978,6 +1053,10 @@ Rules:
             bool(ecg_fallback_reason),
             (time.perf_counter() - start_total) * 1000,
         )
+        result = _validated_upload_analysis_result(
+            result,
+            fallback_message="Không thể tạo AI analysis.",
+        )
         await _store_upload_analysis_cache(cache_key, result)
         return result
     except Exception as exc:
@@ -995,14 +1074,14 @@ Rules:
             safe_title[:120],
             (time.perf_counter() - start_total) * 1000,
         )
-        return {
+        return _validated_upload_analysis_result({
             **base_result,
             "status": "error",
             "summary": "AI analysis is temporarily unavailable for this file.",
             "key_findings": [],
             "recommended_follow_up": [],
             "limitations": ["Could not complete AI analysis at this time."],
-        }
+        }, fallback_message="AI analysis is temporarily unavailable for this file.")
     finally:
         # Keep memory usage stable after one-shot upload analysis.
         await llm_client.unload(analysis_model)

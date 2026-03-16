@@ -29,6 +29,9 @@ from app.models.schemas import (
     # Vital signs
     VitalSignsCreate,
     VitalSignsResponse,
+    ECGPredictionScore,
+    ECGClassifierDetails,
+    MedicalRecordAIAnalysis,
     # Medical records
     MedicalRecordCreate,
     MedicalRecordResponse,
@@ -64,6 +67,9 @@ __all__ = [
     "HealthcareFacilityResponse",
     "VitalSignsCreate",
     "VitalSignsResponse",
+    "ECGPredictionScore",
+    "ECGClassifierDetails",
+    "MedicalRecordAIAnalysis",
     "MedicalRecordCreate",
     "MedicalRecordResponse",
     "ConsultationCreate",
