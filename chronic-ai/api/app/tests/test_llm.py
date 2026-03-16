@@ -169,6 +169,26 @@ class TestUploadAnalysisCacheKey:
 class TestECGUploadAnalysis:
     """Regression tests for the ECG-specific upload analysis branch."""
 
+    def test_extract_json_object_handles_fenced_json(self):
+        from app.services.llm import _extract_json_object
+
+        raw = """
+Here is the analysis:
+```json
+{
+  "summary": "ECG bình thường",
+  "key_findings": ["Không thấy bất thường cấp tính"],
+  "urgency": "low"
+}
+```
+"""
+
+        parsed = _extract_json_object(raw)
+
+        assert parsed is not None
+        assert parsed["summary"] == "ECG bình thường"
+        assert parsed["urgency"] == "low"
+
     @pytest.mark.asyncio
     async def test_ecg_analysis_accepts_adapted_classifier_payload(self, monkeypatch):
         from app.services import llm as llm_module
@@ -228,3 +248,69 @@ class TestECGUploadAnalysis:
         assert result["prediction_scores"][2]["score"] == 0.83
         assert result["ecg_classifier"]["classifier_type"] == "medsiglip_similarity"
         assert result["ecg_classifier"]["predicted_labels"] == ["STTC"]
+
+    @pytest.mark.asyncio
+    async def test_ecg_analysis_parses_fenced_json_and_normalizes_scores(self, monkeypatch):
+        from app.services import llm as llm_module
+
+        async def fake_get_cached_upload_analysis(cache_key):
+            return None
+
+        async def fake_store_upload_analysis_cache(cache_key, result):
+            return None
+
+        async def fake_check_model_available(model):
+            return True
+
+        async def fake_generate(**kwargs):
+            return """
+```json
+{
+  "summary": "ECG nhìn chung bình thường.",
+  "key_findings": ["Không thấy biến đổi ST-T cấp tính."],
+  "clinical_significance": "Chưa ghi nhận dấu hiệu nguy cơ cao trên ảnh ECG.",
+  "recommended_follow_up": ["Theo dõi lâm sàng nếu còn triệu chứng."],
+  "urgency": "low",
+  "confidence": "medium",
+  "limitations": ["Đánh giá dựa trên ảnh tải lên."]
+}
+```
+"""
+
+        async def fake_predict_from_base64(image_base64):
+            return {
+                "classifier_type": "medsiglip_similarity",
+                "checkpoint_path": "remote-score-endpoint",
+                "medsiglip_model_id": "google/medsiglip-448",
+                "classes": ["NORM", "MI", "STTC", "CD", "HYP"],
+                "scores": [-7.508, -7.426, -7.516, -7.637, -7.398],
+                "scores_by_class": {
+                    "NORM": -7.508,
+                    "MI": -7.426,
+                    "STTC": -7.516,
+                    "CD": -7.637,
+                    "HYP": -7.398,
+                },
+                "predicted_labels": [],
+                "threshold": 0.5,
+            }
+
+        monkeypatch.setattr(llm_module, "_get_cached_upload_analysis", fake_get_cached_upload_analysis)
+        monkeypatch.setattr(llm_module, "_store_upload_analysis_cache", fake_store_upload_analysis_cache)
+        monkeypatch.setattr(llm_module.llm_client, "check_model_available", fake_check_model_available)
+        monkeypatch.setattr(llm_module.llm_client, "generate", fake_generate)
+        monkeypatch.setattr(llm_module.llm_client, "unload", fake_check_model_available)
+        monkeypatch.setattr(llm_module.ecg_classifier_service, "predict_from_base64", fake_predict_from_base64)
+
+        result = await llm_module.analyze_uploaded_record(
+            record_type="ecg",
+            title="ECG",
+            extracted_text=None,
+            image_base64="ZmFrZS1pbWFnZQ==",
+        )
+
+        assert result["summary"] == "ECG nhìn chung bình thường."
+        assert result["key_findings"] == ["Không thấy biến đổi ST-T cấp tính."]
+        assert all(0.0 <= row["score"] <= 1.0 for row in result["prediction_scores"])
+        assert sum(row["score"] for row in result["prediction_scores"]) == pytest.approx(1.0, rel=1e-6)
+        assert result["ecg_classifier"]["scores"][0] == -7.508

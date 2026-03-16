@@ -8,6 +8,7 @@ import base64
 import hashlib
 import json
 import logging
+import math
 import re
 import time
 from datetime import datetime, timezone
@@ -49,7 +50,7 @@ UPLOAD_ANALYSIS_SYSTEM = """You are a clinical decision-support assistant for do
 Analyze uploaded medical records and produce concise, practical insights.
 You must return valid JSON only (no markdown or extra commentary)."""
 
-UPLOAD_ANALYSIS_CACHE_TYPE = "upload_analysis:v1"
+UPLOAD_ANALYSIS_CACHE_TYPE = "upload_analysis:v2"
 
 
 def _resolve_upload_analysis_model(*, has_image: bool) -> str:
@@ -61,28 +62,76 @@ def _resolve_upload_analysis_model(*, has_image: bool) -> str:
     return settings.medical_model
 
 
+def _strip_markdown_code_fence(raw_text: str) -> str:
+    text = str(raw_text or "").strip()
+    if not text:
+        return ""
+
+    fenced_match = re.match(r"^```(?:json)?\s*([\s\S]*?)\s*```$", text, re.IGNORECASE)
+    if fenced_match:
+        return fenced_match.group(1).strip()
+    return text
+
+
+def _extract_first_balanced_json_object(raw_text: str) -> Optional[str]:
+    text = str(raw_text or "")
+    if not text:
+        return None
+
+    in_string = False
+    escape = False
+    depth = 0
+    start_index: Optional[int] = None
+
+    for index, char in enumerate(text):
+        if escape:
+            escape = False
+            continue
+        if char == "\\" and in_string:
+            escape = True
+            continue
+        if char == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if char == "{":
+            if depth == 0:
+                start_index = index
+            depth += 1
+            continue
+        if char == "}" and depth > 0:
+            depth -= 1
+            if depth == 0 and start_index is not None:
+                return text[start_index:index + 1]
+
+    return None
+
+
 def _extract_json_object(raw_text: str) -> Optional[dict[str, Any]]:
     """Extract first JSON object from a model response."""
     if not raw_text:
         return None
 
-    try:
-        data = json.loads(raw_text)
-        if isinstance(data, dict):
-            return data
-    except Exception:
-        pass
+    candidates: list[str] = []
+    for candidate in [
+        str(raw_text or "").strip(),
+        _strip_markdown_code_fence(raw_text),
+    ]:
+        candidate = candidate.strip()
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+        balanced_candidate = _extract_first_balanced_json_object(candidate)
+        if balanced_candidate and balanced_candidate not in candidates:
+            candidates.append(balanced_candidate)
 
-    match = re.search(r"\{[\s\S]*\}", raw_text)
-    if not match:
-        return None
-
-    try:
-        data = json.loads(match.group(0))
-        if isinstance(data, dict):
-            return data
-    except Exception:
-        return None
+    for candidate in candidates:
+        try:
+            data = json.loads(candidate)
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            continue
 
     return None
 
@@ -134,6 +183,73 @@ def _sanitize_list(values: list[str], max_items: int = 5, max_item_len: int = 40
         if cleaned:
             out.append(cleaned)
     return out
+
+
+def _extract_plain_text_summary(raw_text: str) -> str:
+    """
+    Build a human-readable summary fallback from model output.
+
+    Avoid returning raw JSON blobs or markdown fences as summary text.
+    """
+    normalized = _strip_markdown_code_fence(raw_text)
+    if not normalized:
+        return ""
+
+    cleaned_lines: list[str] = []
+    for line in normalized.splitlines():
+        text = line.strip().strip(",")
+        if not text or text in {"{", "}", "[", "]"}:
+            continue
+        if text.startswith("```"):
+            continue
+        if re.match(r'^"[^"]+"\s*:', text):
+            continue
+        cleaned_lines.append(text)
+
+    cleaned = " ".join(cleaned_lines).strip() if cleaned_lines else normalized.strip()
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+
+    if not cleaned:
+        return ""
+    if cleaned.startswith("{") or cleaned.startswith("["):
+        return ""
+
+    return _sanitize_text(cleaned, max_len=500)
+
+
+def _resolve_upload_analysis_summary(
+    parsed: dict[str, Any],
+    raw_text: str,
+    *,
+    fallback_message: str,
+) -> str:
+    summary = _sanitize_text(parsed.get("summary"), max_len=1200)
+    if summary:
+        return summary
+
+    fallback_summary = _extract_plain_text_summary(raw_text)
+    if fallback_summary:
+        return fallback_summary
+
+    return fallback_message
+
+
+def _scores_are_probability_like(scores: list[float]) -> bool:
+    return bool(scores) and all(0.0 <= score <= 1.0 for score in scores)
+
+
+def _softmax_normalize_scores(scores: list[float]) -> list[float]:
+    if not scores:
+        return []
+    if _scores_are_probability_like(scores):
+        return [float(score) for score in scores]
+
+    max_score = max(scores)
+    weights = [math.exp(score - max_score) for score in scores]
+    total = sum(weights)
+    if total <= 0:
+        return [0.0 for _ in scores]
+    return [weight / total for weight in weights]
 
 
 _PATIENT_SUMMARY_SECTION_HEADERS: list[tuple[str, str]] = [
@@ -451,6 +567,7 @@ async def _analyze_ecg_with_classifier(
         label: float(score)
         for label, score in zip(classes, scores)
     }
+    normalized_prediction_scores = _softmax_normalize_scores(scores)
     class_description_rows = [
         {
             "class": label,
@@ -465,6 +582,14 @@ async def _analyze_ecg_with_classifier(
             "score": float(score),
         }
         for label, score in zip(classes, scores)
+    ]
+    ui_prediction_score_rows = [
+        {
+            "class": label,
+            "description": ECG_CLASS_DESCRIPTIONS.get(label, label),
+            "score": float(score),
+        }
+        for label, score in zip(classes, normalized_prediction_scores)
     ]
     logger.info(
         "[upload-analysis][ecg] classifier inference done id=%s classifier_type=%s threshold=%.3f predicted=%s top3=%s elapsed_ms=%.1f",
@@ -537,12 +662,11 @@ Rules:
     )
 
     parsed = _extract_json_object(raw) or {}
-    summary = str(parsed.get("summary") or "").strip()
-    if not summary:
-        summary = (raw or "").strip()[:500]
-    if not summary:
-        summary = "Không thể tạo AI analysis."
-    summary = _sanitize_text(summary, max_len=1200)
+    summary = _resolve_upload_analysis_summary(
+        parsed,
+        raw or "",
+        fallback_message="Không thể tạo AI analysis.",
+    )
 
     urgency = str(parsed.get("urgency") or "").strip().lower()
     if urgency not in {"low", "medium", "high"}:
@@ -572,14 +696,15 @@ Rules:
         "urgency": urgency,
         "confidence": confidence,
         "limitations": _sanitize_list(_to_string_list(parsed.get("limitations")), max_item_len=500),
-        # Always persist classifier scores in analysis payload for downstream UI/reporting.
-        "prediction_scores": prediction_score_rows,
+        # Persist UI-friendly probabilities while keeping raw classifier scores below for diagnostics.
+        "prediction_scores": ui_prediction_score_rows,
         "ecg_classifier": {
             "classifier_type": str(classifier_output.get("classifier_type") or ""),
             "checkpoint_path": str(classifier_output.get("checkpoint_path") or ""),
             "medsiglip_model_id": str(classifier_output.get("medsiglip_model_id") or ""),
             "classes": classes,
             "scores": scores,
+            "display_scores": normalized_prediction_scores,
             "scores_by_class": scores_by_class,
             "predicted_labels": [
                 str(item) for item in (classifier_output.get("predicted_labels") or [])
@@ -803,12 +928,11 @@ Rules:
             )
 
         parsed = _extract_json_object(raw) or {}
-        summary = str(parsed.get("summary") or "").strip()
-        if not summary:
-            summary = (raw or "").strip()[:500]
-        if not summary:
-            summary = "Không thể tạo AI analysis."
-        summary = _sanitize_text(summary, max_len=1200)
+        summary = _resolve_upload_analysis_summary(
+            parsed,
+            raw or "",
+            fallback_message="Không thể tạo AI analysis.",
+        )
 
         urgency = str(parsed.get("urgency") or "").strip().lower()
         if urgency not in {"low", "medium", "high"}:
