@@ -22,6 +22,7 @@ Supported auth types (via ECG_CLASSIFIER_AUTH_TYPE):
 from __future__ import annotations
 
 import base64
+import json
 import logging
 import time
 from typing import Any
@@ -98,10 +99,12 @@ class ECGClassifierService:
         except Exception as exc:
             raise RuntimeError(f"Invalid ECG image payload: {exc}") from exc
 
-    def _build_score_request_data(self) -> dict[str, str | list[str]]:
+    def _build_score_request_data(self) -> dict[str, str]:
         return {
             "normalize": "true",
-            "texts": [prompt for _, prompt in ECG_LABEL_PROMPTS],
+            # The MedSigLIP /score endpoint expects `texts` as a JSON string
+            # inside multipart form-data, not as repeated form fields.
+            "texts": json.dumps([prompt for _, prompt in ECG_LABEL_PROMPTS]),
         }
 
     def _normalize_score_response(self, result: dict[str, Any]) -> dict[str, Any]:
