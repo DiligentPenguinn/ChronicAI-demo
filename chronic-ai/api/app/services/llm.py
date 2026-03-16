@@ -52,9 +52,26 @@ Remember: You are a support tool, not a replacement for professional medical adv
 
 UPLOAD_ANALYSIS_SYSTEM = """You are a clinical decision-support assistant for doctors.
 Analyze uploaded medical records and produce concise, practical insights.
-You must return valid JSON only (no markdown or extra commentary)."""
+Return plain text using the exact section structure requested by the user prompt.
+Do not return JSON, markdown fences, or extra commentary outside the requested sections."""
 
 UPLOAD_ANALYSIS_CACHE_TYPE = "upload_analysis:v4"
+
+UPLOAD_ANALYSIS_SECTIONED_FORMAT = """Return plain text using exactly this structure:
+
+Summary: <short clinical summary>
+Key findings:
+- <finding 1>
+- <finding 2>
+Clinical significance: <why this matters clinically>
+Recommended follow-up:
+- <follow-up action 1>
+- <follow-up action 2>
+Urgency: low|medium|high
+Confidence: low|medium|high
+Limitations:
+- <known uncertainty or missing data>
+"""
 
 
 def _resolve_upload_analysis_model(*, has_image: bool) -> str:
@@ -965,29 +982,18 @@ ECG classifier output:
 - predicted_labels: {json.dumps(classifier_output.get("predicted_labels") or [], ensure_ascii=False)}
 - threshold: {float(classifier_output.get("threshold", 0.5))}
 
-Return JSON with this exact schema:
-{{
-  "summary": "short clinical summary",
-  "key_findings": ["finding 1", "finding 2"],
-  "clinical_significance": "why this matters clinically",
-  "recommended_follow_up": ["follow-up action 1", "follow-up action 2"],
-  "urgency": "low|medium|high",
-  "confidence": "low|medium|high",
-  "limitations": ["known uncertainty or missing data"],
-  "prediction_scores": [
-    {{"class": "NORM", "description": "Normal ECG", "score": 0.12}},
-    {{"class": "MI", "description": "Myocardial Infarction", "score": 0.78}}
-  ]
-}}
+{UPLOAD_ANALYSIS_SECTIONED_FORMAT}
 
 Rules:
 - Use Vietnamese for user-facing fields.
 - Use proper Vietnamese diacritics (tone marks); do not remove accents.
 - Use the image as primary evidence and classifier scores as supporting evidence.
 - Do not claim a diagnosis with absolute certainty.
-- Always include prediction_scores and keep class names exactly as provided.
+- Keep the section headers exactly as written above.
+- Use `- ` list items only under Key findings, Recommended follow-up, and Limitations.
 - Keep summary under 120 words.
-- Return valid JSON only.
+- Do not return JSON.
+- Do not include markdown fences.
 """
 
     logger.info("[upload-analysis][ecg] medgemma call start id=%s", request_id)
@@ -1186,24 +1192,18 @@ Record metadata:
 Extracted text (OCR):
 {extracted or "No OCR text available."}
 
-Return JSON with this exact schema:
-{{
-  "summary": "short clinical summary",
-  "key_findings": ["finding 1", "finding 2"],
-  "clinical_significance": "why this matters clinically",
-  "recommended_follow_up": ["follow-up action 1", "follow-up action 2"],
-  "urgency": "low|medium|high",
-  "confidence": "low|medium|high",
-  "limitations": ["known uncertainty or missing data"]
-}}
+{UPLOAD_ANALYSIS_SECTIONED_FORMAT}
 
 Rules:
 - Use Vietnamese for user-facing fields.
 - Use proper Vietnamese diacritics (tone marks); do not remove accents.
+- Keep the section headers exactly as written above.
+- Use `- ` list items only under Key findings, Recommended follow-up, and Limitations.
 - Keep summary under 120 words.
 - Keep key_findings and recommended_follow_up concise and actionable.
 - If data is limited, state that clearly in limitations.
-- Return valid JSON only.
+- Do not return JSON.
+- Do not include markdown fences.
 """
 
     model_available = await llm_client.check_model_available(analysis_model)

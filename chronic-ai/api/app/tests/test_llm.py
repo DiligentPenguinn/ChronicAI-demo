@@ -463,6 +463,9 @@ Limitations:
             return True
 
         async def fake_generate(**kwargs):
+            assert "Return plain text using exactly this structure:" in kwargs["prompt"]
+            assert "Do not return JSON." in kwargs["prompt"]
+            assert "Do not include markdown fences." in kwargs["prompt"]
             return """
 Summary: Điện tâm đồ nhìn chung ổn định, chưa thấy dấu hiệu cấp cứu rõ.
 Key findings:
@@ -500,7 +503,7 @@ Limitations:
         ]
 
     @pytest.mark.asyncio
-    async def test_ecg_analysis_parses_fenced_json_and_normalizes_scores(self, monkeypatch):
+    async def test_ecg_analysis_parses_sectioned_text_and_normalizes_scores(self, monkeypatch):
         from app.services import llm as llm_module
 
         async def fake_get_cached_upload_analysis(cache_key):
@@ -513,18 +516,20 @@ Limitations:
             return True
 
         async def fake_generate(**kwargs):
+            assert "Return plain text using exactly this structure:" in kwargs["prompt"]
+            assert "Do not return JSON." in kwargs["prompt"]
+            assert "Do not include markdown fences." in kwargs["prompt"]
             return """
-```json
-{
-  "summary": "ECG nhìn chung bình thường.",
-  "key_findings": ["Không thấy biến đổi ST-T cấp tính."],
-  "clinical_significance": "Chưa ghi nhận dấu hiệu nguy cơ cao trên ảnh ECG.",
-  "recommended_follow_up": ["Theo dõi lâm sàng nếu còn triệu chứng."],
-  "urgency": "low",
-  "confidence": "medium",
-  "limitations": ["Đánh giá dựa trên ảnh tải lên."]
-}
-```
+Summary: ECG nhìn chung bình thường.
+Key findings:
+- Không thấy biến đổi ST-T cấp tính.
+Clinical significance: Chưa ghi nhận dấu hiệu nguy cơ cao trên ảnh ECG.
+Recommended follow-up:
+- Theo dõi lâm sàng nếu còn triệu chứng.
+Urgency: low
+Confidence: medium
+Limitations:
+- Đánh giá dựa trên ảnh tải lên.
 """
 
         async def fake_predict_from_base64(image_base64):
