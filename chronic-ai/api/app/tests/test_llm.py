@@ -569,3 +569,69 @@ Limitations:
         assert all(0.0 <= row["score"] <= 1.0 for row in result["prediction_scores"])
         assert sum(row["score"] for row in result["prediction_scores"]) == pytest.approx(1.0, rel=1e-6)
         assert result["ecg_classifier"]["scores"][0] == -7.508
+
+    @pytest.mark.asyncio
+    async def test_ecg_analysis_replaces_placeholder_llm_output_with_classifier_fallback(self, monkeypatch):
+        from app.services import llm as llm_module
+
+        async def fake_get_cached_upload_analysis(cache_key):
+            return None
+
+        async def fake_store_upload_analysis_cache(cache_key, result):
+            return None
+
+        async def fake_check_model_available(model):
+            return True
+
+        async def fake_generate(**kwargs):
+            return """
+Summary: ECG image shows a normal ECG.
+Key findings:
+- ECG image shows normal ECG
+Clinical significance:
+Recommended follow-up:
+- No follow-up actions
+Urgency: low|medium|high
+Confidence: high
+Limitations:
+- ECG image
+"""
+
+        async def fake_predict_from_base64(image_base64):
+            return {
+                "classifier_type": "moe",
+                "checkpoint_path": "remote-score-endpoint",
+                "medsiglip_model_id": "google/medsiglip-448",
+                "classes": ["NORM", "CD", "MI", "STTC", "HYP"],
+                "scores": [0.8441537, 0.1204533, 0.0293933, 0.015, 0.009],
+                "scores_by_class": {
+                    "NORM": 0.8441537,
+                    "CD": 0.1204533,
+                    "MI": 0.0293933,
+                    "STTC": 0.015,
+                    "HYP": 0.009,
+                },
+                "predicted_labels": ["NORM"],
+                "threshold": 0.5,
+            }
+
+        monkeypatch.setattr(llm_module, "_get_cached_upload_analysis", fake_get_cached_upload_analysis)
+        monkeypatch.setattr(llm_module, "_store_upload_analysis_cache", fake_store_upload_analysis_cache)
+        monkeypatch.setattr(llm_module.llm_client, "check_model_available", fake_check_model_available)
+        monkeypatch.setattr(llm_module.llm_client, "generate", fake_generate)
+        monkeypatch.setattr(llm_module.llm_client, "unload", fake_check_model_available)
+        monkeypatch.setattr(llm_module.ecg_classifier_service, "predict_from_base64", fake_predict_from_base64)
+
+        result = await llm_module.analyze_uploaded_record(
+            record_type="ecg",
+            title="ECG",
+            extracted_text=None,
+            image_base64="ZmFrZS1pbWFnZQ==",
+        )
+
+        assert result["status"] == "completed"
+        assert "ECG bình thường" in result["summary"]
+        assert "ECG image shows" not in result["summary"]
+        assert result["urgency"] == "low"
+        assert result["confidence"] == "high"
+        assert any("dựng từ điểm bộ phân loại" in item for item in result["limitations"])

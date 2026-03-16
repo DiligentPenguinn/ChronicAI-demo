@@ -773,6 +773,212 @@ ECG_CLASS_DESCRIPTIONS: dict[str, str] = {
     "HYP": "Hypertrophy",
 }
 
+ECG_CLASS_DESCRIPTIONS_VI: dict[str, str] = {
+    "NORM": "ECG trong giới hạn bình thường",
+    "MI": "gợi ý nhồi máu cơ tim",
+    "STTC": "thay đổi ST/T",
+    "CD": "rối loạn dẫn truyền",
+    "HYP": "dấu hiệu phì đại",
+}
+
+_ECG_LOW_QUALITY_OUTPUT_MARKERS = (
+    "ecg image shows",
+    "normal ecg",
+    "no follow up actions",
+    "urgency low medium high",
+    "confidence low medium high",
+)
+
+
+def _format_percent(value: float) -> str:
+    return f"{float(value) * 100:.1f}%"
+
+
+def _sorted_prediction_score_rows(
+    prediction_scores: list[dict[str, Any]],
+    *,
+    top_k: Optional[int] = None,
+) -> list[dict[str, Any]]:
+    ranked = sorted(
+        prediction_scores,
+        key=lambda item: float(item.get("score") or 0.0),
+        reverse=True,
+    )
+    if top_k is None:
+        return ranked
+    return ranked[:top_k]
+
+
+def _estimate_ecg_classifier_confidence(
+    prediction_scores: list[dict[str, Any]],
+) -> str:
+    ranked = _sorted_prediction_score_rows(prediction_scores, top_k=2)
+    if not ranked:
+        return "low"
+    top_score = float(ranked[0].get("score") or 0.0)
+    second_score = float(ranked[1].get("score") or 0.0) if len(ranked) > 1 else 0.0
+    margin = top_score - second_score
+    if top_score >= 0.8 and margin >= 0.45:
+        return "high"
+    if top_score >= 0.55 and margin >= 0.15:
+        return "medium"
+    return "low"
+
+
+def _estimate_ecg_classifier_urgency(
+    prediction_scores: list[dict[str, Any]],
+    predicted_labels: list[str],
+) -> str:
+    ranked = _sorted_prediction_score_rows(prediction_scores, top_k=1)
+    if not ranked:
+        return "medium"
+
+    predicted = {str(label).strip().upper() for label in (predicted_labels or []) if str(label).strip()}
+    top_label = str(ranked[0].get("class") or "").upper()
+    top_score = float(ranked[0].get("score") or 0.0)
+
+    if "MI" in predicted or (top_label == "MI" and top_score >= 0.35):
+        return "high"
+    if predicted.intersection({"STTC", "CD", "HYP"}):
+        return "medium"
+    if top_label in {"STTC", "CD", "HYP"} and top_score >= 0.35:
+        return "medium"
+    if top_label == "NORM" and top_score >= 0.65:
+        return "low"
+    return "medium"
+
+
+def _looks_like_low_quality_ecg_output(
+    repaired_payload: dict[str, Any],
+    raw_text: str,
+) -> bool:
+    normalized_raw = _normalize_label_text(raw_text)
+    if any(marker in normalized_raw for marker in _ECG_LOW_QUALITY_OUTPUT_MARKERS):
+        return True
+
+    summary = _normalize_label_text(repaired_payload.get("summary") or "")
+    findings = " ".join(
+        _normalize_label_text(item)
+        for item in (repaired_payload.get("key_findings") or [])
+    ).strip()
+    follow_up = " ".join(
+        _normalize_label_text(item)
+        for item in (repaired_payload.get("recommended_follow_up") or [])
+    ).strip()
+
+    placeholder_pairs = (
+        ("ecg image shows", summary),
+        ("normal ecg", summary),
+        ("no follow up actions", follow_up),
+    )
+    if any(token in text for token, text in placeholder_pairs if text):
+        return True
+
+    if summary and findings and summary == findings:
+        return True
+
+    return False
+
+
+def _build_ecg_classifier_fallback_analysis(
+    *,
+    prediction_scores: list[dict[str, Any]],
+    predicted_labels: list[str],
+    reason: str,
+) -> dict[str, Any]:
+    ranked = _sorted_prediction_score_rows(prediction_scores, top_k=3)
+    if not ranked:
+        return {
+            "summary": "Không thể suy ra nhận định ECG đáng tin cậy từ bộ phân loại.",
+            "key_findings": [],
+            "clinical_significance": "Cần đọc ECG gốc bởi bác sĩ để kết luận.",
+            "recommended_follow_up": [
+                "Đọc lại ECG gốc và đối chiếu với triệu chứng lâm sàng.",
+            ],
+            "urgency": "medium",
+            "confidence": "low",
+            "limitations": [
+                reason,
+                "Không có đủ điểm phân loại để tạo tóm tắt tự động.",
+            ],
+        }
+
+    top_row = ranked[0]
+    top_label = str(top_row.get("class") or "").upper()
+    top_score = float(top_row.get("score") or 0.0)
+    top_vi = ECG_CLASS_DESCRIPTIONS_VI.get(top_label, ECG_CLASS_DESCRIPTIONS.get(top_label, top_label))
+    top_en = ECG_CLASS_DESCRIPTIONS.get(top_label, top_label)
+    alternatives = [
+        f"{str(row.get('class') or '').upper()} {_format_percent(float(row.get('score') or 0.0))}"
+        for row in ranked[1:]
+        if row.get("class")
+    ]
+    predicted = [str(label).strip().upper() for label in (predicted_labels or []) if str(label).strip()]
+
+    if top_label == "NORM":
+        summary = (
+            f"Bộ phân loại ECG tự động nghiêng về ECG bình thường, với nhóm {top_label} "
+            f"({top_en}) cao nhất ở mức {_format_percent(top_score)}."
+        )
+    else:
+        summary = (
+            f"Bộ phân loại ECG tự động ưu tiên nhóm {top_label} ({top_vi}) với xác suất hiển thị "
+            f"{_format_percent(top_score)}; cần đối chiếu ngay với ECG gốc và bệnh cảnh lâm sàng."
+        )
+
+    key_findings = [
+        f"Nhóm điểm cao nhất: {top_label} ({top_en}) {_format_percent(top_score)}.",
+    ]
+    if alternatives:
+        key_findings.append(f"Các nhóm tiếp theo: {', '.join(alternatives)}.")
+    if predicted:
+        key_findings.append(f"Nhãn vượt ngưỡng của bộ phân loại: {', '.join(predicted)}.")
+    key_findings.append(
+        "Kết quả này được suy ra từ bộ phân loại ảnh ECG và không thay thế cho đọc ECG chuẩn 12 chuyển đạo."
+    )
+
+    urgency = _estimate_ecg_classifier_urgency(prediction_scores, predicted)
+    confidence = _estimate_ecg_classifier_confidence(prediction_scores)
+
+    if urgency == "high":
+        follow_up = [
+            "Đánh giá tim mạch khẩn, đối chiếu ECG gốc và triệu chứng ngay.",
+            "Nếu có đau ngực, khó thở, ngất hoặc huyết động không ổn định, xử trí cấp cứu ngay.",
+        ]
+    elif urgency == "medium":
+        follow_up = [
+            "Đọc lại ECG gốc, so sánh với triệu chứng và ECG trước đó nếu có.",
+            "Cân nhắc hội chẩn tim mạch nếu còn nghi ngờ hoặc bệnh nhân có triệu chứng.",
+        ]
+    else:
+        follow_up = [
+            "Đối chiếu với triệu chứng hiện tại và bản ECG gốc trước khi kết luận.",
+            "Nếu bệnh nhân có đau ngực, khó thở, ngất hoặc triệu chứng cấp, vẫn cần đánh giá y khoa sớm.",
+        ]
+
+    clinical_significance = (
+        "Ưu tiên xem đây là gợi ý sàng lọc từ bộ phân loại ảnh; quyết định lâm sàng cần dựa trên ECG gốc, "
+        "triệu chứng và thăm khám."
+    )
+
+    return {
+        "summary": summary,
+        "key_findings": _sanitize_list(key_findings, max_items=4, max_item_len=400),
+        "clinical_significance": _sanitize_text(clinical_significance, max_len=1200),
+        "recommended_follow_up": _sanitize_list(follow_up, max_items=3, max_item_len=400),
+        "urgency": urgency,
+        "confidence": confidence,
+        "limitations": _sanitize_list(
+            [
+                reason,
+                "Phản hồi từ LLM không đủ chất lượng nên phần diễn giải này được dựng từ điểm bộ phân loại.",
+                "Không thay thế cho diễn giải ECG bởi bác sĩ.",
+            ],
+            max_items=4,
+            max_item_len=500,
+        ),
+    }
+
 
 def _classify_llm_error(message: str) -> str:
     """Convert low-level LLM errors into backend diagnostic reason text."""
@@ -988,10 +1194,13 @@ Rules:
 - Use Vietnamese for user-facing fields.
 - Use proper Vietnamese diacritics (tone marks); do not remove accents.
 - Use the image as primary evidence and classifier scores as supporting evidence.
+- Mention the highest-scoring ECG class in the summary or key findings.
 - Do not claim a diagnosis with absolute certainty.
 - Keep the section headers exactly as written above.
 - Use `- ` list items only under Key findings, Recommended follow-up, and Limitations.
 - Keep summary under 120 words.
+- Do not repeat template placeholders such as `<finding 1>` or `low|medium|high`.
+- Do not answer in English.
 - Do not return JSON.
 - Do not include markdown fences.
 """
@@ -1016,6 +1225,20 @@ Rules:
 
     parsed = _extract_json_object(raw)
     repaired = _repair_upload_analysis_payload(parsed, raw or "")
+    if _looks_like_low_quality_ecg_output(repaired, raw or ""):
+        logger.warning(
+            "[upload-analysis][ecg] low-quality llm output id=%s preview=%s",
+            request_id,
+            _preview_model_output_for_log(raw or ""),
+        )
+        repaired = _build_ecg_classifier_fallback_analysis(
+            prediction_scores=ui_prediction_score_rows,
+            predicted_labels=[
+                str(item) for item in (classifier_output.get("predicted_labels") or [])
+            ],
+            reason="LLM trả về nội dung quá chung chung hoặc còn placeholder.",
+        )
+
     if not _repaired_payload_has_meaningful_content(repaired):
         logger.warning(
             "[upload-analysis][ecg] invalid structured output id=%s preview=%s",
