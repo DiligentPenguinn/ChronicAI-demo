@@ -3,13 +3,17 @@ ECG classifier service.
 
 Pipeline:
 1) Receive base64-encoded ECG image.
-2) Call a remote ECG classifier endpoint (MedSigLIP + MoE).
+2) Call a remote ECG classifier or MedSigLIP embedding endpoint.
 3) Return per-class scores for downstream MedGemma analysis.
 
-The endpoint runs the full pipeline: image → MedSigLIP embedding → classifier → scores.
+Supported remote pipelines:
+- image → remote classifier → scores
+- image → remote MedSigLIP embedding → local classifier checkpoint → scores
+
 This service only makes an HTTP call; it supports both of the protocols used in this repo:
   - POST /predict with JSON {"image_base64": "..."}
   - POST /score with multipart form-data and prompt texts
+  - POST /embed/image with multipart form-data and image file
 
 Supported auth types (via ECG_CLASSIFIER_AUTH_TYPE):
   - none:          No auth headers (local dev, VPN-protected endpoints)
@@ -22,9 +26,11 @@ Supported auth types (via ECG_CLASSIFIER_AUTH_TYPE):
 from __future__ import annotations
 
 import base64
+from functools import lru_cache
 import json
 import logging
 import time
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -46,8 +52,9 @@ DEFAULT_SCORE_THRESHOLD = 0.5
 class ECGClassifierService:
     """Calls a remote ECG classifier endpoint for predictions.
 
-    Works with any HTTP endpoint that accepts ``{"image_base64": "..."}``
-    and returns per-class scores.  Auth is controlled by
+    Works with remote endpoints that either return per-class scores directly
+    or return a MedSigLIP image embedding that this service can score locally.
+    Auth is controlled by
     ``ECG_CLASSIFIER_AUTH_TYPE`` (see module docstring).
     """
 
@@ -73,9 +80,13 @@ class ECGClassifierService:
         Supported modes:
         - predict_json: POST JSON {"image_base64": "..."} to /predict or Vertex :predict
         - score_multipart: POST multipart image+texts to /score
+        - embed_image_multipart: POST multipart file upload to /embed/image
         """
         base_url = self._get_endpoint_url().rstrip("/")
         lowered = base_url.lower()
+
+        if lowered.endswith("/embed/image"):
+            return [("embed_image_multipart", base_url)]
 
         if lowered.endswith("/score"):
             return [("score_multipart", base_url)]
@@ -86,6 +97,7 @@ class ECGClassifierService:
         return [
             ("predict_json", f"{base_url}/predict"),
             ("score_multipart", f"{base_url}/score"),
+            ("embed_image_multipart", f"{base_url}/embed/image"),
         ]
 
     def _decode_image_base64(self, image_base64: str) -> bytes:
@@ -106,6 +118,25 @@ class ECGClassifierService:
             # inside multipart form-data, not as repeated form fields.
             "texts": json.dumps([prompt for _, prompt in ECG_LABEL_PROMPTS]),
         }
+
+    def _resolve_checkpoint_path(self) -> Path:
+        configured = str(getattr(settings, "ecg_classifier_checkpoint_path", "") or "").strip()
+        if configured:
+            return Path(configured).expanduser()
+        return (
+            Path(__file__).resolve().parents[3]
+            / "ecg_classifier"
+            / "embed_data"
+            / "moe_classifier_medsiglip.pt"
+        )
+
+    def _resolve_medsiglip_model_id(self, result: dict[str, Any]) -> str:
+        return str(
+            result.get("medsiglip_model_id")
+            or result.get("model")
+            or getattr(settings, "ecg_medsiglip_model_id", "")
+            or "google/medsiglip-448"
+        )
 
     def _normalize_score_response(self, result: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(result, dict):
@@ -144,7 +175,7 @@ class ECGClassifierService:
         return {
             "classifier_type": "medsiglip_similarity",
             "checkpoint_path": "remote-score-endpoint",
-            "medsiglip_model_id": str(result.get("model") or ""),
+            "medsiglip_model_id": self._resolve_medsiglip_model_id(result),
             "classes": classes,
             "scores": scores,
             "scores_by_class": scores_by_class,
@@ -195,15 +226,35 @@ class ECGClassifierService:
         return {
             "classifier_type": str(result.get("classifier_type") or "remote-predict-endpoint"),
             "checkpoint_path": str(result.get("checkpoint_path") or "remote-predict-endpoint"),
-            "medsiglip_model_id": str(
-                result.get("medsiglip_model_id") or result.get("model") or ""
-            ),
+            "medsiglip_model_id": self._resolve_medsiglip_model_id(result),
             "classes": classes,
             "scores": scores,
             "scores_by_class": scores_by_class,
             "predicted_labels": normalized_predicted_labels,
             "threshold": float(result.get("threshold", DEFAULT_SCORE_THRESHOLD)),
         }
+
+    def _normalize_embed_image_response(self, result: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(result, dict):
+            raise RuntimeError("MedSigLIP embedding endpoint returned a non-object response.")
+
+        raw_embedding = result.get("embedding")
+        if not isinstance(raw_embedding, list) or not raw_embedding:
+            raise RuntimeError(
+                "MedSigLIP embedding endpoint returned missing or empty embedding."
+            )
+
+        try:
+            embedding = [float(value) for value in raw_embedding]
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "MedSigLIP embedding endpoint returned a non-numeric embedding."
+            ) from exc
+
+        return self._predict_from_embedding(
+            embedding,
+            medsiglip_model_id=self._resolve_medsiglip_model_id(result),
+        )
 
     async def _post_predict_json(
         self,
@@ -233,6 +284,70 @@ class ECGClassifierService:
             data=self._build_score_request_data(),
             files=[("files", ("ecg-upload.png", image_bytes, "image/png"))],
         )
+
+    async def _post_embed_image_multipart(
+        self,
+        client: httpx.AsyncClient,
+        endpoint_url: str,
+        headers: dict[str, str],
+        image_bytes: bytes,
+    ) -> httpx.Response:
+        multipart_headers = dict(headers)
+        multipart_headers.pop("Content-Type", None)
+        return await client.post(
+            endpoint_url,
+            headers=multipart_headers,
+            files=[("file", ("ecg-upload.png", image_bytes, "image/png"))],
+        )
+
+    def _predict_from_embedding(
+        self,
+        embedding: list[float],
+        *,
+        medsiglip_model_id: str,
+    ) -> dict[str, Any]:
+        classifier_state = _load_local_classifier_state(str(self._resolve_checkpoint_path()))
+
+        if len(embedding) != classifier_state["embed_dim"]:
+            raise RuntimeError(
+                "MedSigLIP embedding endpoint returned wrong embedding length: "
+                f"expected={classifier_state['embed_dim']} got={len(embedding)}"
+            )
+
+        try:
+            import torch
+        except ModuleNotFoundError as exc:  # pragma: no cover
+            raise RuntimeError(
+                "ECG embedding scoring requires PyTorch in the API runtime."
+            ) from exc
+
+        with torch.no_grad():
+            input_tensor = torch.tensor([embedding], dtype=torch.float32)
+            logits_output = classifier_state["model"](input_tensor)
+            logits = logits_output[0] if isinstance(logits_output, tuple) else logits_output
+            scores = torch.sigmoid(logits).detach().cpu().view(-1).tolist()
+
+        classes = list(classifier_state["classes"])
+        scores_by_class = {
+            label: float(score)
+            for label, score in zip(classes, scores)
+        }
+        threshold = float(classifier_state["threshold"])
+        predicted_labels = [
+            label for label, score in zip(classes, scores)
+            if score >= threshold
+        ]
+
+        return {
+            "classifier_type": str(classifier_state["model_type"]),
+            "checkpoint_path": f"local-checkpoint:{Path(classifier_state['checkpoint_path']).name}",
+            "medsiglip_model_id": medsiglip_model_id,
+            "classes": classes,
+            "scores": [float(score) for score in scores],
+            "scores_by_class": scores_by_class,
+            "predicted_labels": predicted_labels,
+            "threshold": threshold,
+        }
 
     async def _get_auth_headers(self) -> dict[str, str]:
         """
@@ -331,6 +446,13 @@ class ECGClassifierService:
                                 headers,
                                 image_bytes,
                             )
+                        elif mode == "embed_image_multipart":
+                            response = await self._post_embed_image_multipart(
+                                client,
+                                endpoint_url,
+                                headers,
+                                image_bytes,
+                            )
                         else:
                             raise RuntimeError(f"Unsupported ECG classifier request mode: {mode}")
 
@@ -379,6 +501,8 @@ class ECGClassifierService:
 
         if selected_mode == "predict_json":
             prediction = self._normalize_predict_response(result)
+        elif selected_mode == "embed_image_multipart":
+            prediction = self._normalize_embed_image_response(result)
         else:
             prediction = self._normalize_score_response(result)
 
@@ -398,3 +522,169 @@ class ECGClassifierService:
 
 
 ecg_classifier_service = ECGClassifierService()
+
+
+@lru_cache(maxsize=4)
+def _load_local_classifier_state(checkpoint_path: str) -> dict[str, Any]:
+    try:
+        import torch
+        import torch.nn as nn
+    except ModuleNotFoundError as exc:  # pragma: no cover
+        raise RuntimeError(
+            "ECG embedding scoring requires PyTorch in the API runtime."
+        ) from exc
+
+    class ExpertMLP(nn.Module):
+        def __init__(
+            self,
+            in_dim: int,
+            out_dim: int,
+            hidden: tuple[int, ...] = (1028, 512, 256),
+            dropout: tuple[float, ...] = (0.15, 0.15, 0.10),
+        ):
+            super().__init__()
+            layers: list[nn.Module] = []
+            prev = in_dim
+            dropout_values = tuple(float(p) for p in dropout)
+            if len(dropout_values) < len(hidden):
+                dropout_values = dropout_values + (0.0,) * (len(hidden) - len(dropout_values))
+            elif len(dropout_values) > len(hidden):
+                dropout_values = dropout_values[: len(hidden)]
+            for h, p in zip(hidden, dropout_values):
+                layers.append(nn.Linear(prev, h))
+                layers.append(nn.LayerNorm(h))
+                layers.append(nn.GELU())
+                layers.append(nn.Dropout(p))
+                prev = h
+            layers.append(nn.Linear(prev, out_dim))
+            self.net = nn.Sequential(*layers)
+
+        def forward(self, x: Any) -> Any:
+            return self.net(x)
+
+    class MoEClassifier(nn.Module):
+        def __init__(
+            self,
+            in_dim: int,
+            out_dim: int,
+            num_experts: int = 5,
+            gate_hidden: int = 512,
+            temperature: float = 1.0,
+            expert_hidden: tuple[int, ...] = (1028, 512, 256),
+            expert_dropout: tuple[float, ...] = (0.15, 0.15, 0.10),
+        ):
+            super().__init__()
+            self.temperature = temperature
+            self.experts = nn.ModuleList(
+                [
+                    ExpertMLP(in_dim, out_dim, hidden=expert_hidden, dropout=expert_dropout)
+                    for _ in range(num_experts)
+                ]
+            )
+            self.gate = nn.Sequential(
+                nn.Linear(in_dim, gate_hidden),
+                nn.ReLU(),
+                nn.Linear(gate_hidden, num_experts),
+            )
+
+        def forward(self, x: Any) -> Any:
+            gate_logits = self.gate(x) / self.temperature
+            gate_w = torch.softmax(gate_logits, dim=-1)
+            expert_logits = torch.stack([expert(x) for expert in self.experts], dim=1)
+            mixed_logits = torch.sum(expert_logits * gate_w.unsqueeze(-1), dim=1)
+            return mixed_logits, gate_w, expert_logits
+
+    class MLPClassifier(nn.Module):
+        def __init__(self, in_dim: int, hidden_1: int, hidden_2: int, out_dim: int):
+            super().__init__()
+            self.fc1 = nn.Linear(in_dim, hidden_1)
+            self.fc2 = nn.Linear(hidden_1, hidden_2)
+            self.out = nn.Linear(hidden_2, out_dim)
+            self.relu = nn.ReLU()
+
+        def forward(self, x: Any) -> Any:
+            x = self.relu(self.fc1(x))
+            x = self.relu(self.fc2(x))
+            return self.out(x)
+
+    def build_classifier(ckpt: dict[str, Any]) -> tuple[Any, str]:
+        state_dict = ckpt.get("state_dict")
+        if not isinstance(state_dict, dict) or not state_dict:
+            raise RuntimeError("Checkpoint missing state_dict.")
+
+        embed_dim = int(ckpt["embed_dim"])
+        num_classes = int(ckpt["num_classes"])
+
+        if any(key.startswith("experts.") for key in state_dict):
+            num_experts = int(ckpt.get("num_experts", 5))
+            expert_linear_layers: list[tuple[int, Any]] = []
+            for key, value in state_dict.items():
+                if (
+                    key.startswith("experts.0.net.")
+                    and key.endswith(".weight")
+                    and isinstance(value, torch.Tensor)
+                    and value.ndim == 2
+                ):
+                    layer_index = int(key.split(".")[3])
+                    expert_linear_layers.append((layer_index, value))
+
+            if len(expert_linear_layers) < 2:
+                raise RuntimeError("Unable to infer expert architecture from checkpoint.")
+
+            expert_linear_layers.sort(key=lambda item: item[0])
+            expert_hidden = tuple(int(w.shape[0]) for _, w in expert_linear_layers[:-1])
+            gate_hidden = (
+                int(state_dict["gate.0.weight"].shape[0])
+                if "gate.0.weight" in state_dict
+                else 256
+            )
+            model = MoEClassifier(
+                in_dim=embed_dim,
+                out_dim=num_classes,
+                num_experts=num_experts,
+                gate_hidden=gate_hidden,
+                temperature=1.0,
+                expert_hidden=expert_hidden,
+                expert_dropout=tuple(0.0 for _ in expert_hidden),
+            )
+            model_type = "moe"
+        elif {"fc1.weight", "fc2.weight", "out.weight"}.issubset(state_dict):
+            hidden_1 = int(state_dict["fc1.weight"].shape[0])
+            hidden_2 = int(state_dict["fc2.weight"].shape[0])
+            model = MLPClassifier(embed_dim, hidden_1, hidden_2, num_classes)
+            model_type = "mlp"
+        else:
+            raise RuntimeError("Unsupported checkpoint format.")
+
+        model.load_state_dict(state_dict, strict=True)
+        model.eval()
+        return model, model_type
+
+    path = Path(checkpoint_path).expanduser().resolve()
+    if not path.exists():
+        raise RuntimeError(f"ECG classifier checkpoint not found: {path}")
+
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    model, model_type = build_classifier(ckpt)
+    classes = [str(item) for item in (ckpt.get("classes") or [])]
+    if not classes:
+        classes = [label for label, _ in ECG_LABEL_PROMPTS]
+
+    configured_threshold = getattr(settings, "ecg_classifier_threshold", DEFAULT_SCORE_THRESHOLD)
+    threshold = float(
+        configured_threshold
+        if configured_threshold is not None
+        else ckpt.get("threshold", DEFAULT_SCORE_THRESHOLD)
+    )
+    embed_dim = int(ckpt.get("embed_dim") or 0)
+    if embed_dim <= 0:
+        raise RuntimeError("Checkpoint missing valid embed_dim.")
+
+    return {
+        "model": model,
+        "model_type": model_type,
+        "classes": classes,
+        "threshold": threshold,
+        "embed_dim": embed_dim,
+        "checkpoint_path": str(path),
+    }

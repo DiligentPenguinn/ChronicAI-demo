@@ -149,14 +149,21 @@ class Settings(BaseSettings):
     # Optional dedicated model for upload-file AI analysis (especially image uploads).
     # If empty, upload analysis falls back to medical_model.
     upload_analysis_model: str = ""
-    # ECG Classifier Remote Endpoint
-    ecg_classifier_endpoint_url: str = ""  # Any HTTP endpoint that accepts {"image_base64": "..."}
+    # ECG classifier / MedSigLIP remote endpoint.
+    # Supported endpoints:
+    # - /predict      -> returns class scores directly
+    # - /score        -> returns class scores directly
+    # - /embed/image  -> returns image embedding; backend scores it locally
+    ecg_classifier_endpoint_url: str = ""
     ecg_classifier_endpoint_timeout: int = 60
     # Auth type: none | bearer | api_key | vertex_gcloud (default, backward-compat)
     ecg_classifier_auth_type: str = "vertex_gcloud"
     ecg_classifier_bearer_token: str = ""   # Used when auth_type=bearer
     ecg_classifier_api_key: str = ""        # Used when auth_type=api_key
     ecg_classifier_api_key_header: str = "X-API-Key"  # Header name for api_key auth
+    ecg_medsiglip_model_id: str = "google/medsiglip-448"
+    ecg_classifier_checkpoint_path: str = ""
+    ecg_classifier_threshold: float = 0.5
     # Upload pipeline behavior
     # False by default: image uploads go directly to LLM (no OCR in hot path)
     image_upload_run_ocr: bool = False
