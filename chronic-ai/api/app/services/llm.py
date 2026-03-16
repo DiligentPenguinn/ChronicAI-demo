@@ -11,6 +11,7 @@ import logging
 import math
 import re
 import time
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 import uuid
@@ -139,6 +140,43 @@ def _extract_json_object(raw_text: str) -> Optional[dict[str, Any]]:
     return None
 
 
+def _normalize_label_text(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", str(value or ""))
+    normalized = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    normalized = normalized.lower()
+    normalized = re.sub(r"[_*`#>\-]+", " ", normalized)
+    normalized = re.sub(r"[^a-z0-9\s]", " ", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized
+
+
+def _canonical_upload_analysis_field(label: str) -> Optional[str]:
+    normalized = _normalize_label_text(label)
+    field_aliases = {
+        "summary": {"summary", "tom tat"},
+        "key_findings": {"key findings", "findings", "diem chinh", "phat hien"},
+        "clinical_significance": {
+            "clinical significance",
+            "significance",
+            "y nghia lam sang",
+        },
+        "recommended_follow_up": {
+            "recommended follow up",
+            "follow up",
+            "followup",
+            "de xuat theo doi",
+            "khuyen nghi",
+        },
+        "urgency": {"urgency", "muc do khan", "khan cap"},
+        "confidence": {"confidence", "do tin cay"},
+        "limitations": {"limitations", "gioi han"},
+    }
+    for field_name, aliases in field_aliases.items():
+        if normalized in aliases:
+            return field_name
+    return None
+
+
 def _to_string_list(value: Any, max_items: int = 5) -> list[str]:
     """Normalize a model field into a list of non-empty strings."""
     if isinstance(value, list):
@@ -186,6 +224,40 @@ def _sanitize_list(values: list[str], max_items: int = 5, max_item_len: int = 40
         if cleaned:
             out.append(cleaned)
     return out
+
+
+def _coerce_upload_analysis_list(
+    value: Any,
+    *,
+    max_items: int = 5,
+    max_item_len: int = 400,
+) -> list[str]:
+    """Best-effort normalization for list-like LLM fields."""
+    if isinstance(value, list):
+        return _sanitize_list([str(item) for item in value], max_items=max_items, max_item_len=max_item_len)
+
+    if not isinstance(value, str):
+        return []
+
+    text = _sanitize_text(value, max_len=max_items * max_item_len)
+    if not text:
+        return []
+
+    parts = [
+        part.strip(" -•*;\t")
+        for part in re.split(r"\n+|;\s+|(?<!\d)\s+[•*-]\s+|\s*\|\s*", text)
+        if part.strip(" -•*;\t")
+    ]
+    if len(parts) <= 1:
+        numbered_parts = [
+            item.strip(" -•*;\t")
+            for item in re.split(r"\s*(?:\d+[.)])\s*", text)
+            if item.strip(" -•*;\t")
+        ]
+        if len(numbered_parts) > 1:
+            parts = numbered_parts
+
+    return _sanitize_list(parts or [text], max_items=max_items, max_item_len=max_item_len)
 
 
 def _extract_plain_text_summary(raw_text: str) -> str:
@@ -271,6 +343,197 @@ def _resolve_upload_analysis_summary(
     return fallback_message
 
 
+def _preview_model_output_for_log(raw_text: str, max_len: int = 280) -> str:
+    """Create a short one-line preview of raw model output for debugging logs."""
+    normalized = _strip_markdown_code_fence(raw_text)
+    preview = re.sub(r"\s+", " ", normalized).strip()
+    if not preview:
+        return "<empty>"
+    if len(preview) > max_len:
+        return f"{preview[:max_len].rstrip()}..."
+    return preview
+
+
+def _extract_structured_sections_from_text(raw_text: str) -> dict[str, Any]:
+    """
+    Best-effort section extraction for weak model outputs that are not valid JSON.
+
+    Supports simple markdown/text formats such as:
+    Summary: ...
+    Key findings:
+    - item 1
+    - item 2
+    """
+    normalized = _strip_markdown_code_fence(raw_text)
+    if not normalized:
+        return {}
+
+    sections: dict[str, list[str]] = {}
+    current_field: Optional[str] = None
+    fallback_lines: list[str] = []
+
+    for raw_line in normalized.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        candidate = line.lstrip("-*•# ").strip()
+        if not candidate:
+            continue
+
+        label_part: Optional[str] = None
+        content_part = ""
+        for separator in (":", "-", " - "):
+            if separator in candidate:
+                possible_label, possible_content = candidate.split(separator, 1)
+                canonical = _canonical_upload_analysis_field(possible_label)
+                if canonical:
+                    label_part = canonical
+                    content_part = possible_content.strip()
+                    break
+
+        if not label_part:
+            canonical = _canonical_upload_analysis_field(candidate)
+            if canonical:
+                label_part = canonical
+                content_part = ""
+
+        if label_part:
+            current_field = label_part
+            sections.setdefault(current_field, [])
+            if content_part:
+                sections[current_field].append(content_part)
+            continue
+
+        if current_field:
+            sections.setdefault(current_field, []).append(candidate)
+        else:
+            fallback_lines.append(candidate)
+
+    extracted: dict[str, Any] = {}
+
+    summary_candidates = sections.get("summary") or []
+    summary_text = " ".join(summary_candidates).strip()
+    if not summary_text and fallback_lines:
+        summary_text = fallback_lines[0]
+    summary_text = _sanitize_text(summary_text, max_len=1200)
+    if summary_text and not _looks_like_garbled_summary(summary_text):
+        extracted["summary"] = summary_text
+
+    key_findings = _coerce_upload_analysis_list("\n".join(sections.get("key_findings") or []))
+    if key_findings:
+        extracted["key_findings"] = key_findings
+
+    clinical_significance = _sanitize_text(
+        " ".join(sections.get("clinical_significance") or []),
+        max_len=1200,
+    )
+    if clinical_significance:
+        extracted["clinical_significance"] = clinical_significance
+
+    follow_up = _coerce_upload_analysis_list("\n".join(sections.get("recommended_follow_up") or []))
+    if follow_up:
+        extracted["recommended_follow_up"] = follow_up
+
+    limitations = _coerce_upload_analysis_list("\n".join(sections.get("limitations") or []), max_item_len=500)
+    if limitations:
+        extracted["limitations"] = limitations
+
+    urgency_text = " ".join(sections.get("urgency") or []).strip()
+    if urgency_text:
+        extracted["urgency"] = urgency_text
+
+    confidence_text = " ".join(sections.get("confidence") or []).strip()
+    if confidence_text:
+        extracted["confidence"] = confidence_text
+
+    return extracted
+
+
+def _normalize_upload_analysis_level(value: Any, default: str = "medium") -> str:
+    normalized = _normalize_label_text(str(value or ""))
+    if normalized in {"high", "cao"}:
+        return "high"
+    if normalized in {"low", "thap"}:
+        return "low"
+    if normalized in {"medium", "trung binh", "moderate"}:
+        return "medium"
+    return default
+
+
+def _repair_upload_analysis_payload(parsed: Optional[dict[str, Any]], raw_text: str) -> dict[str, Any]:
+    """Repair weak model output into the expected upload-analysis shape."""
+    extracted = _extract_structured_sections_from_text(raw_text)
+    source = dict(parsed or {})
+
+    for alias, canonical in {
+        "findings": "key_findings",
+        "clinical_assessment": "clinical_significance",
+        "significance": "clinical_significance",
+        "follow_up": "recommended_follow_up",
+        "recommended_actions": "recommended_follow_up",
+        "next_steps": "recommended_follow_up",
+    }.items():
+        if canonical not in source and alias in source:
+            source[canonical] = source.get(alias)
+
+    repaired: dict[str, Any] = {}
+
+    summary = _sanitize_text(
+        source.get("summary") or extracted.get("summary"),
+        max_len=1200,
+    )
+    if summary and not _looks_like_garbled_summary(summary):
+        repaired["summary"] = summary
+
+    key_findings = _coerce_upload_analysis_list(
+        source.get("key_findings") or extracted.get("key_findings"),
+    )
+    if key_findings:
+        repaired["key_findings"] = key_findings
+
+    clinical_significance = _sanitize_text(
+        source.get("clinical_significance") or extracted.get("clinical_significance"),
+        max_len=1200,
+    )
+    if clinical_significance:
+        repaired["clinical_significance"] = clinical_significance
+
+    recommended_follow_up = _coerce_upload_analysis_list(
+        source.get("recommended_follow_up") or extracted.get("recommended_follow_up"),
+    )
+    if recommended_follow_up:
+        repaired["recommended_follow_up"] = recommended_follow_up
+
+    limitations = _coerce_upload_analysis_list(
+        source.get("limitations") or extracted.get("limitations"),
+        max_item_len=500,
+    )
+    if limitations:
+        repaired["limitations"] = limitations
+
+    if "urgency" in source or "urgency" in extracted:
+        repaired["urgency"] = _normalize_upload_analysis_level(
+            source.get("urgency") or extracted.get("urgency"),
+        )
+
+    if "confidence" in source or "confidence" in extracted:
+        repaired["confidence"] = _normalize_upload_analysis_level(
+            source.get("confidence") or extracted.get("confidence"),
+        )
+
+    return repaired
+
+
+def _repaired_payload_has_meaningful_content(payload: dict[str, Any]) -> bool:
+    return bool(
+        payload.get("summary")
+        or payload.get("key_findings")
+        or payload.get("clinical_significance")
+        or payload.get("recommended_follow_up")
+    )
+
+
 def _validated_upload_analysis_result(
     result: dict[str, Any],
     *,
@@ -295,7 +558,7 @@ def _validated_upload_analysis_result(
             "summary": fallback_message,
             "key_findings": [],
             "recommended_follow_up": [],
-            "limitations": ["Structured AI output validation failed."],
+            "limitations": ["LLM returned invalid structured output."],
         }
         validated = MedicalRecordAIAnalysis.model_validate(fallback_result)
         return validated.model_dump(mode="json", by_alias=True, exclude_none=True)
@@ -662,6 +925,19 @@ async def _analyze_ecg_with_classifier(
         }
         for label, score in zip(classes, normalized_prediction_scores)
     ]
+    ecg_classifier_details = {
+        "classifier_type": str(classifier_output.get("classifier_type") or ""),
+        "checkpoint_path": str(classifier_output.get("checkpoint_path") or ""),
+        "medsiglip_model_id": str(classifier_output.get("medsiglip_model_id") or ""),
+        "classes": classes,
+        "scores": scores,
+        "display_scores": normalized_prediction_scores,
+        "scores_by_class": scores_by_class,
+        "predicted_labels": [
+            str(item) for item in (classifier_output.get("predicted_labels") or [])
+        ],
+        "threshold": float(classifier_output.get("threshold", 0.5)),
+    }
     logger.info(
         "[upload-analysis][ecg] classifier inference done id=%s classifier_type=%s threshold=%.3f predicted=%s top3=%s elapsed_ms=%.1f",
         request_id,
@@ -732,28 +1008,51 @@ Rules:
         llm_elapsed_ms,
     )
 
-    parsed = _extract_json_object(raw) or {}
+    parsed = _extract_json_object(raw)
+    repaired = _repair_upload_analysis_payload(parsed, raw or "")
+    if not _repaired_payload_has_meaningful_content(repaired):
+        logger.warning(
+            "[upload-analysis][ecg] invalid structured output id=%s preview=%s",
+            request_id,
+            _preview_model_output_for_log(raw or ""),
+        )
+        return _validated_upload_analysis_result(
+            {
+                **base_result,
+                "status": "error",
+                "summary": "Không thể tạo AI analysis.",
+                "key_findings": [],
+                "recommended_follow_up": [],
+                "limitations": ["LLM returned invalid structured output."],
+                "prediction_scores": ui_prediction_score_rows,
+                "ecg_classifier": ecg_classifier_details,
+            },
+            fallback_message="Không thể tạo AI analysis.",
+        )
+
+    if not parsed:
+        logger.info(
+            "[upload-analysis][ecg] repaired non-json output id=%s preview=%s",
+            request_id,
+            _preview_model_output_for_log(raw or ""),
+        )
+
     summary = _resolve_upload_analysis_summary(
-        parsed,
+        repaired,
         raw or "",
         fallback_message="Không thể tạo AI analysis.",
     )
 
-    urgency = str(parsed.get("urgency") or "").strip().lower()
-    if urgency not in {"low", "medium", "high"}:
-        urgency = "medium"
-
-    confidence = str(parsed.get("confidence") or "").strip().lower()
-    if confidence not in {"low", "medium", "high"}:
-        confidence = "medium"
+    urgency = _normalize_upload_analysis_level(repaired.get("urgency"))
+    confidence = _normalize_upload_analysis_level(repaired.get("confidence"))
     total_elapsed_ms = (time.perf_counter() - start_total) * 1000
     logger.info(
         "[upload-analysis][ecg] completed id=%s urgency=%s confidence=%s findings=%s follow_up=%s elapsed_ms=%.1f",
         request_id,
         urgency,
         confidence,
-        len(_sanitize_list(_to_string_list(parsed.get("key_findings")))),
-        len(_sanitize_list(_to_string_list(parsed.get("recommended_follow_up")))),
+        len(repaired.get("key_findings") or []),
+        len(repaired.get("recommended_follow_up") or []),
         total_elapsed_ms,
     )
 
@@ -761,27 +1060,15 @@ Rules:
         **base_result,
         "status": "completed",
         "summary": summary,
-        "key_findings": _sanitize_list(_to_string_list(parsed.get("key_findings"))),
-        "clinical_significance": _sanitize_text(parsed.get("clinical_significance"), max_len=1200),
-        "recommended_follow_up": _sanitize_list(_to_string_list(parsed.get("recommended_follow_up"))),
+        "key_findings": repaired.get("key_findings") or [],
+        "clinical_significance": repaired.get("clinical_significance"),
+        "recommended_follow_up": repaired.get("recommended_follow_up") or [],
         "urgency": urgency,
         "confidence": confidence,
-        "limitations": _sanitize_list(_to_string_list(parsed.get("limitations")), max_item_len=500),
+        "limitations": repaired.get("limitations") or [],
         # Persist UI-friendly probabilities while keeping raw classifier scores below for diagnostics.
         "prediction_scores": ui_prediction_score_rows,
-        "ecg_classifier": {
-            "classifier_type": str(classifier_output.get("classifier_type") or ""),
-            "checkpoint_path": str(classifier_output.get("checkpoint_path") or ""),
-            "medsiglip_model_id": str(classifier_output.get("medsiglip_model_id") or ""),
-            "classes": classes,
-            "scores": scores,
-            "display_scores": normalized_prediction_scores,
-            "scores_by_class": scores_by_class,
-            "predicted_labels": [
-                str(item) for item in (classifier_output.get("predicted_labels") or [])
-            ],
-            "threshold": float(classifier_output.get("threshold", 0.5)),
-        },
+        "ecg_classifier": ecg_classifier_details,
     }, fallback_message="Không thể tạo AI analysis.")
 
 
@@ -1002,31 +1289,58 @@ Rules:
                 len(raw or ""),
             )
 
-        parsed = _extract_json_object(raw) or {}
+        parsed = _extract_json_object(raw)
+        repaired = _repair_upload_analysis_payload(parsed, raw or "")
+        if not _repaired_payload_has_meaningful_content(repaired):
+            limitations = ["LLM returned invalid structured output."]
+            if ecg_fallback_reason:
+                limitations.append("ECG classifier path failed, used default upload analysis flow.")
+            if multimodal_error:
+                limitations.append("Image analysis fallback was used due to multimodal request failure.")
+
+            logger.warning(
+                "[upload-analysis] invalid structured output id=%s preview=%s",
+                request_id,
+                _preview_model_output_for_log(raw or ""),
+            )
+            return _validated_upload_analysis_result(
+                {
+                    **base_result,
+                    "status": "error",
+                    "summary": "Không thể tạo AI analysis.",
+                    "key_findings": [],
+                    "recommended_follow_up": [],
+                    "limitations": _sanitize_list(limitations, max_items=6, max_item_len=500),
+                },
+                fallback_message="Không thể tạo AI analysis.",
+            )
+
+        if not parsed:
+            logger.info(
+                "[upload-analysis] repaired non-json output id=%s preview=%s",
+                request_id,
+                _preview_model_output_for_log(raw or ""),
+            )
+
         summary = _resolve_upload_analysis_summary(
-            parsed,
+            repaired,
             raw or "",
             fallback_message="Không thể tạo AI analysis.",
         )
 
-        urgency = str(parsed.get("urgency") or "").strip().lower()
-        if urgency not in {"low", "medium", "high"}:
-            urgency = "medium"
-
-        confidence = str(parsed.get("confidence") or "").strip().lower()
-        if confidence not in {"low", "medium", "high"}:
-            confidence = "medium"
+        urgency = _normalize_upload_analysis_level(repaired.get("urgency"))
+        confidence = _normalize_upload_analysis_level(repaired.get("confidence"))
 
         result: dict[str, Any] = {
             **base_result,
             "status": "completed",
             "summary": summary,
-            "key_findings": _sanitize_list(_to_string_list(parsed.get("key_findings"))),
-            "clinical_significance": _sanitize_text(parsed.get("clinical_significance"), max_len=1200),
-            "recommended_follow_up": _sanitize_list(_to_string_list(parsed.get("recommended_follow_up"))),
+            "key_findings": repaired.get("key_findings") or [],
+            "clinical_significance": repaired.get("clinical_significance"),
+            "recommended_follow_up": repaired.get("recommended_follow_up") or [],
             "urgency": urgency,
             "confidence": confidence,
-            "limitations": _sanitize_list(_to_string_list(parsed.get("limitations")), max_item_len=500),
+            "limitations": repaired.get("limitations") or [],
         }
         if ecg_fallback_reason:
             result["limitations"] = _sanitize_list(
