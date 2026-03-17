@@ -1124,7 +1124,14 @@ async def _analyze_ecg_with_classifier(
         label: float(score)
         for label, score in zip(classes, scores)
     }
-    normalized_prediction_scores = _softmax_normalize_scores(scores)
+    raw_probabilities = classifier_output.get("probabilities") or []
+    probabilities = [float(item) for item in raw_probabilities]
+    if len(probabilities) != len(classes) or not _scores_are_probability_like(probabilities):
+        probabilities = _softmax_normalize_scores(scores)
+    probabilities_by_class = {
+        label: float(probability)
+        for label, probability in zip(classes, probabilities)
+    }
     class_description_rows = [
         {
             "class": label,
@@ -1132,7 +1139,7 @@ async def _analyze_ecg_with_classifier(
         }
         for label in classes
     ]
-    prediction_score_rows = [
+    raw_score_rows = [
         {
             "class": label,
             "description": ECG_CLASS_DESCRIPTIONS.get(label, label),
@@ -1144,22 +1151,33 @@ async def _analyze_ecg_with_classifier(
         {
             "class": label,
             "description": ECG_CLASS_DESCRIPTIONS.get(label, label),
-            "score": float(score),
+            "score": float(probability),
         }
-        for label, score in zip(classes, normalized_prediction_scores)
+        for label, probability in zip(classes, probabilities)
     ]
     ecg_classifier_details = {
         "classifier_type": str(classifier_output.get("classifier_type") or ""),
         "checkpoint_path": str(classifier_output.get("checkpoint_path") or ""),
         "medsiglip_model_id": str(classifier_output.get("medsiglip_model_id") or ""),
+        "device": str(classifier_output.get("device") or ""),
         "classes": classes,
         "scores": scores,
-        "display_scores": normalized_prediction_scores,
+        "display_scores": probabilities,
         "scores_by_class": scores_by_class,
+        "probabilities": probabilities,
+        "probabilities_by_class": probabilities_by_class,
+        "predictions": [int(item) for item in (classifier_output.get("predictions") or [])],
+        "predictions_by_class": {
+            str(label): int(value)
+            for label, value in (classifier_output.get("predictions_by_class") or {}).items()
+        },
         "predicted_labels": [
             str(item) for item in (classifier_output.get("predicted_labels") or [])
         ],
         "threshold": float(classifier_output.get("threshold", 0.5)),
+        "gate_weights": [float(item) for item in (classifier_output.get("gate_weights") or [])],
+        "num_experts": int(classifier_output.get("num_experts") or 0),
+        "scoring_mode": str(classifier_output.get("scoring_mode") or ""),
     }
     logger.info(
         "[upload-analysis][ecg] classifier inference done id=%s classifier_type=%s threshold=%.3f predicted=%s top3=%s elapsed_ms=%.1f",
@@ -1182,9 +1200,12 @@ Record metadata:
 ECG classifier output:
 - classes (ordered): {json.dumps(classes, ensure_ascii=False)}
 - class_descriptions: {json.dumps(class_description_rows, ensure_ascii=False)}
-- scores (same order): {json.dumps(scores, ensure_ascii=False)}
+- raw_logits (same order): {json.dumps(scores, ensure_ascii=False)}
 - scores_by_class: {json.dumps(scores_by_class, ensure_ascii=False)}
-- prediction_score_rows: {json.dumps(prediction_score_rows, ensure_ascii=False)}
+- probabilities (same order): {json.dumps(probabilities, ensure_ascii=False)}
+- probabilities_by_class: {json.dumps(probabilities_by_class, ensure_ascii=False)}
+- raw_score_rows: {json.dumps(raw_score_rows, ensure_ascii=False)}
+- prediction_score_rows: {json.dumps(ui_prediction_score_rows, ensure_ascii=False)}
 - predicted_labels: {json.dumps(classifier_output.get("predicted_labels") or [], ensure_ascii=False)}
 - threshold: {float(classifier_output.get("threshold", 0.5))}
 

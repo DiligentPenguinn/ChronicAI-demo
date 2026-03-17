@@ -152,7 +152,7 @@ class Settings(BaseSettings):
     # ECG classifier / MedSigLIP remote endpoint.
     # Supported endpoints:
     # - /predict      -> returns class scores directly
-    # - /score        -> returns class scores directly
+    # - /score        -> runs image -> MedSigLIP -> MoE scoring and returns logits/probabilities
     # - /embed/image  -> returns image embedding; backend scores it locally
     ecg_classifier_endpoint_url: str = ""
     ecg_classifier_endpoint_timeout: int = 60

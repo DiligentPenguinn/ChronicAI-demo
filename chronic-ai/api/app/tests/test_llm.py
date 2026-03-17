@@ -358,20 +358,38 @@ Limitations:
 
         async def fake_predict_from_base64(image_base64):
             return {
-                "classifier_type": "medsiglip_similarity",
+                "classifier_type": "moe_classifier",
                 "checkpoint_path": "remote-score-endpoint",
                 "medsiglip_model_id": "google/medsiglip-448",
                 "classes": ["NORM", "MI", "STTC", "CD", "HYP"],
-                "scores": [0.12, 0.21, 0.83, 0.34, 0.45],
+                "scores": [-1.8, -0.7, 1.9, 0.1, 0.4],
                 "scores_by_class": {
-                    "NORM": 0.12,
-                    "MI": 0.21,
-                    "STTC": 0.83,
-                    "CD": 0.34,
-                    "HYP": 0.45,
+                    "NORM": -1.8,
+                    "MI": -0.7,
+                    "STTC": 1.9,
+                    "CD": 0.1,
+                    "HYP": 0.4,
                 },
-                "predicted_labels": ["STTC"],
-                "threshold": 0.5,
+                "probabilities": [0.14, 0.33, 0.87, 0.52, 0.6],
+                "probabilities_by_class": {
+                    "NORM": 0.14,
+                    "MI": 0.33,
+                    "STTC": 0.87,
+                    "CD": 0.52,
+                    "HYP": 0.6,
+                },
+                "predictions": [0, 1, 1, 1, 1],
+                "predictions_by_class": {
+                    "NORM": 0,
+                    "MI": 1,
+                    "STTC": 1,
+                    "CD": 1,
+                    "HYP": 1,
+                },
+                "predicted_labels": ["MI", "STTC", "CD", "HYP"],
+                "threshold": 0.3,
+                "gate_weights": [0.02, 0.03, 0.75, 0.1, 0.1],
+                "num_experts": 5,
             }
 
         monkeypatch.setattr(llm_module, "_get_cached_upload_analysis", fake_get_cached_upload_analysis)
@@ -391,9 +409,11 @@ Limitations:
         assert result["status"] == "completed"
         assert result["summary"] == "Tóm tắt ECG"
         assert result["prediction_scores"][2]["class"] == "STTC"
-        assert result["prediction_scores"][2]["score"] == 0.83
-        assert result["ecg_classifier"]["classifier_type"] == "medsiglip_similarity"
-        assert result["ecg_classifier"]["predicted_labels"] == ["STTC"]
+        assert result["prediction_scores"][2]["score"] == 0.87
+        assert result["ecg_classifier"]["classifier_type"] == "moe_classifier"
+        assert result["ecg_classifier"]["predicted_labels"] == ["MI", "STTC", "CD", "HYP"]
+        assert result["ecg_classifier"]["scores"][2] == 1.9
+        assert result["ecg_classifier"]["display_scores"][2] == 0.87
 
     @pytest.mark.asyncio
     async def test_ecg_analysis_marks_invalid_model_output_as_error(self, monkeypatch):

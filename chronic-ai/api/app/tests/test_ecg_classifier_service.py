@@ -5,7 +5,6 @@ Tests verify that _get_auth_headers produces correct headers for each
 ECG_CLASSIFIER_AUTH_TYPE without touching the network or gcloud CLI.
 """
 import base64
-import json
 import sys
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -188,19 +187,35 @@ class TestPredictFromBase64:
             "embedding": [0.1, -0.2, 0.3],
         }
         local_prediction = {
-            "classifier_type": "moe",
+            "classifier_type": "moe_classifier",
             "checkpoint_path": "local-checkpoint:moe_classifier_medsiglip.pt",
             "medsiglip_model_id": "google/medsiglip-448",
             "classes": [label for label, _ in ECG_LABEL_PROMPTS],
-            "scores": [0.1, 0.2, 0.8, 0.4, 0.5],
+            "scores": [-1.2, -0.7, 1.4, 0.1, 0.9],
             "scores_by_class": {
-                "NORM": 0.1,
-                "MI": 0.2,
-                "STTC": 0.8,
-                "CD": 0.4,
-                "HYP": 0.5,
+                "NORM": -1.2,
+                "MI": -0.7,
+                "STTC": 1.4,
+                "CD": 0.1,
+                "HYP": 0.9,
             },
-            "predicted_labels": ["STTC", "HYP"],
+            "probabilities": [0.23, 0.33, 0.8, 0.52, 0.71],
+            "probabilities_by_class": {
+                "NORM": 0.23,
+                "MI": 0.33,
+                "STTC": 0.8,
+                "CD": 0.52,
+                "HYP": 0.71,
+            },
+            "predictions": [0, 0, 1, 1, 1],
+            "predictions_by_class": {
+                "NORM": 0,
+                "MI": 0,
+                "STTC": 1,
+                "CD": 1,
+                "HYP": 1,
+            },
+            "predicted_labels": ["STTC", "CD", "HYP"],
             "threshold": 0.5,
         }
 
@@ -232,10 +247,45 @@ class TestPredictFromBase64:
         image_bytes = b"fake-png-data"
         image_base64 = base64.b64encode(image_bytes).decode("ascii")
         remote_payload = {
-            "model": "google/medsiglip-448",
+            "classifier_type": "moe_classifier",
+            "medsiglip_model_id": "google/medsiglip-448",
             "device": "cpu",
-            "scores": [[0.91, 0.22, 0.61, 0.49, 0.85]],
-            "normalized": True,
+            "classes": [label for label, _ in ECG_LABEL_PROMPTS],
+            "threshold": 0.3,
+            "num_experts": 5,
+            "results": [
+                {
+                    "index": 0,
+                    "embedding": [0.1, -0.2, 0.3],
+                    "scores": [-0.9, -0.4, 1.1, 0.2, 0.8],
+                    "scores_by_class": {
+                        "NORM": -0.9,
+                        "MI": -0.4,
+                        "STTC": 1.1,
+                        "CD": 0.2,
+                        "HYP": 0.8,
+                    },
+                    "probabilities": [0.289, 0.401, 0.75, 0.55, 0.69],
+                    "probabilities_by_class": {
+                        "NORM": 0.289,
+                        "MI": 0.401,
+                        "STTC": 0.75,
+                        "CD": 0.55,
+                        "HYP": 0.69,
+                    },
+                    "predictions": [0, 1, 1, 1, 1],
+                    "predictions_by_class": {
+                        "NORM": 0,
+                        "MI": 1,
+                        "STTC": 1,
+                        "CD": 1,
+                        "HYP": 1,
+                    },
+                    "predicted_labels": ["MI", "STTC", "CD", "HYP"],
+                    "gate_weights": [0.02, 0.03, 0.75, 0.1, 0.1],
+                }
+            ],
+            "scoring_mode": "image -> MedSigLIP image embedding -> MoE classifier logits -> sigmoid probabilities -> thresholded predictions",
         }
 
         with patch("app.services.ecg_classifier_service.settings") as ms:
@@ -250,29 +300,31 @@ class TestPredictFromBase64:
         expected_classes = [label for label, _ in ECG_LABEL_PROMPTS]
         assert recorder["url"] == "https://example.test/api/score"
         assert recorder["kwargs"]["headers"] == {"Authorization": "Bearer token"}
-        assert recorder["kwargs"]["data"]["normalize"] == "true"
-        assert json.loads(recorder["kwargs"]["data"]["texts"]) == [
-            prompt for _, prompt in ECG_LABEL_PROMPTS
-        ]
+        assert "data" not in recorder["kwargs"]
         uploaded_file = recorder["kwargs"]["files"][0]
-        assert uploaded_file[0] == "files"
+        assert uploaded_file[0] == "file"
         assert uploaded_file[1][0] == "ecg-upload.png"
         assert uploaded_file[1][1] == image_bytes
-        assert result["classifier_type"] == "medsiglip_similarity"
+        assert result["classifier_type"] == "moe_classifier"
         assert result["checkpoint_path"] == "remote-score-endpoint"
         assert result["medsiglip_model_id"] == "google/medsiglip-448"
         assert result["classes"] == expected_classes
-        assert result["scores"] == remote_payload["scores"][0]
-        assert result["scores_by_class"]["NORM"] == 0.91
-        assert result["scores_by_class"]["HYP"] == 0.85
-        assert result["predicted_labels"] == ["NORM", "STTC", "HYP"]
-        assert result["threshold"] == DEFAULT_SCORE_THRESHOLD
+        assert result["scores"] == remote_payload["results"][0]["scores"]
+        assert result["scores_by_class"]["NORM"] == -0.9
+        assert result["probabilities_by_class"]["HYP"] == 0.69
+        assert result["predicted_labels"] == ["MI", "STTC", "CD", "HYP"]
+        assert result["gate_weights"] == [0.02, 0.03, 0.75, 0.1, 0.1]
+        assert result["threshold"] == 0.3
+        assert result["num_experts"] == 5
 
     @pytest.mark.asyncio
     async def test_predict_from_base64_keeps_explicit_score_endpoint(self, service):
         recorder = {}
         image_base64 = base64.b64encode(b"img").decode("ascii")
-        remote_payload = {"model": "m", "scores": [[0.1, 0.2, 0.3, 0.4, 0.5]]}
+        remote_payload = {
+            "classes": [label for label, _ in ECG_LABEL_PROMPTS],
+            "results": [{"scores": [0.1, 0.2, 0.3, 0.4, 0.5]}],
+        }
 
         with patch("app.services.ecg_classifier_service.settings") as ms:
             ms.ecg_classifier_endpoint_url = "https://example.test/custom/score"
@@ -290,12 +342,14 @@ class TestPredictFromBase64:
         recorder = {}
         image_base64 = base64.b64encode(b"img").decode("ascii")
         remote_payload = {
-            "classifier_type": "moe",
+            "classifier_type": "moe_classifier",
             "checkpoint_path": "vertex-endpoint",
             "medsiglip_model_id": "google/medsiglip-448",
             "classes": [label for label, _ in ECG_LABEL_PROMPTS],
-            "scores": [0.1, 0.2, 0.8, 0.4, 0.5],
-            "predicted_labels": ["STTC", "HYP"],
+            "scores": [-0.2, 0.1, 1.4, -0.4, 0.8],
+            "probabilities": [0.45, 0.52, 0.8, 0.4, 0.69],
+            "predictions": [0, 1, 1, 0, 1],
+            "predicted_labels": ["MI", "STTC", "HYP"],
             "threshold": 0.5,
         }
 
@@ -312,10 +366,11 @@ class TestPredictFromBase64:
         assert recorder["kwargs"]["headers"]["Content-Type"] == "application/json"
         assert recorder["kwargs"]["json"] == {"image_base64": image_base64}
         assert "files" not in recorder["kwargs"]
-        assert result["classifier_type"] == "moe"
+        assert result["classifier_type"] == "moe_classifier"
         assert result["checkpoint_path"] == "vertex-endpoint"
         assert result["scores"] == remote_payload["scores"]
-        assert result["predicted_labels"] == ["STTC", "HYP"]
+        assert result["probabilities"] == remote_payload["probabilities"]
+        assert result["predicted_labels"] == ["MI", "STTC", "HYP"]
 
     @pytest.mark.asyncio
     async def test_predict_from_base64_tries_predict_then_falls_back_to_score(self, service):
@@ -323,8 +378,14 @@ class TestPredictFromBase64:
         image_bytes = b"fake-png-data"
         image_base64 = base64.b64encode(image_bytes).decode("ascii")
         remote_payload = {
-            "model": "google/medsiglip-448",
-            "scores": [[0.91, 0.22, 0.61, 0.49, 0.85]],
+            "classifier_type": "moe_classifier",
+            "classes": [label for label, _ in ECG_LABEL_PROMPTS],
+            "results": [
+                {
+                    "scores": [-0.9, -0.4, 1.1, 0.2, 0.8],
+                    "probabilities": [0.289, 0.401, 0.75, 0.55, 0.69],
+                }
+            ],
         }
 
         def responder(url, kwargs):
@@ -353,12 +414,16 @@ class TestPredictFromBase64:
         assert recorder["calls"][0]["kwargs"]["json"] == {"image_base64": image_base64}
         uploaded_file = recorder["calls"][1]["kwargs"]["files"][0]
         assert uploaded_file[1][1] == image_bytes
-        assert result["predicted_labels"] == ["NORM", "STTC", "HYP"]
+        assert uploaded_file[0] == "file"
+        assert result["predicted_labels"] == ["STTC", "CD", "HYP"]
 
     @pytest.mark.asyncio
     async def test_predict_from_base64_rejects_wrong_score_vector_length(self, service):
         image_base64 = base64.b64encode(b"img").decode("ascii")
-        remote_payload = {"model": "m", "scores": [[0.1, 0.2]]}
+        remote_payload = {
+            "classes": [label for label, _ in ECG_LABEL_PROMPTS],
+            "results": [{"scores": [0.1, 0.2]}],
+        }
 
         with patch("app.services.ecg_classifier_service.settings") as ms:
             ms.ecg_classifier_endpoint_url = "https://example.test/score"
@@ -373,7 +438,10 @@ class TestPredictFromBase64:
     @pytest.mark.asyncio
     async def test_predict_from_base64_rejects_non_numeric_scores(self, service):
         image_base64 = base64.b64encode(b"img").decode("ascii")
-        remote_payload = {"model": "m", "scores": [["bad", 0.2, 0.3, 0.4, 0.5]]}
+        remote_payload = {
+            "classes": [label for label, _ in ECG_LABEL_PROMPTS],
+            "results": [{"scores": ["bad", 0.2, 0.3, 0.4, 0.5]}],
+        }
 
         with patch("app.services.ecg_classifier_service.settings") as ms:
             ms.ecg_classifier_endpoint_url = "https://example.test/score"
@@ -385,24 +453,22 @@ class TestPredictFromBase64:
                     with pytest.raises(RuntimeError, match="non-numeric scores"):
                         await service.predict_from_base64(image_base64)
 
-    def test_build_score_request_data_is_async_safe_for_httpx_multipart(self, service):
+    def test_score_request_is_async_safe_for_httpx_multipart(self, service):
         request = httpx.AsyncClient().build_request(
             "POST",
             "https://example.test/score",
-            data=service._build_score_request_data(),
-            files={"files": ("ecg-upload.png", b"img", "image/png")},
+            files={"file": ("ecg-upload.png", b"img", "image/png")},
         )
 
         assert isinstance(request.stream, httpx._multipart.MultipartStream)
 
-    def test_build_score_request_data_json_encodes_prompt_list(self, service):
-        payload = service._build_score_request_data()
+    def test_resolve_checkpoint_path_supports_classifier_ckpt_path_env(self, service, monkeypatch):
+        monkeypatch.delenv("CLASSIFIER_CKPT_PATH", raising=False)
+        monkeypatch.setenv("CLASSIFIER_CKPT_PATH", "/tmp/moe_classifier_medsiglip.pt")
 
-        assert payload["normalize"] == "true"
-        assert isinstance(payload["texts"], str)
-        assert json.loads(payload["texts"]) == [
-            prompt for _, prompt in ECG_LABEL_PROMPTS
-        ]
+        resolved = service._resolve_checkpoint_path()
+
+        assert str(resolved) == "/tmp/moe_classifier_medsiglip.pt"
 
     def test_normalize_embed_image_response_rejects_non_numeric_values(self, service):
         with pytest.raises(RuntimeError, match="non-numeric embedding"):

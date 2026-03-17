@@ -555,17 +555,27 @@ class ECGClassifierDetails(BaseModel):
     classifier_type: Optional[str] = Field(None, max_length=100)
     checkpoint_path: Optional[str] = Field(None, max_length=255)
     medsiglip_model_id: Optional[str] = Field(None, max_length=255)
+    device: Optional[str] = Field(None, max_length=64)
     classes: list[str] = Field(default_factory=list)
     scores: list[float] = Field(default_factory=list)
     display_scores: list[float] = Field(default_factory=list)
     scores_by_class: dict[str, float] = Field(default_factory=dict)
+    probabilities: list[float] = Field(default_factory=list)
+    probabilities_by_class: dict[str, float] = Field(default_factory=dict)
+    predictions: list[int] = Field(default_factory=list)
+    predictions_by_class: dict[str, int] = Field(default_factory=dict)
     predicted_labels: list[str] = Field(default_factory=list)
     threshold: Optional[float] = Field(None, ge=0.0)
+    gate_weights: list[float] = Field(default_factory=list)
+    num_experts: Optional[int] = Field(None, ge=0)
+    scoring_mode: Optional[str] = Field(None, max_length=255)
 
     @field_validator(
         "classifier_type",
         "checkpoint_path",
         "medsiglip_model_id",
+        "device",
+        "scoring_mode",
         mode="before",
     )
     @classmethod
@@ -589,6 +599,20 @@ class ECGClassifierDetails(BaseModel):
     def _validate_display_scores(cls, value):
         if any(score < 0.0 or score > 1.0 for score in value):
             raise ValueError("display_scores must be between 0 and 1")
+        return value
+
+    @field_validator("probabilities", "gate_weights")
+    @classmethod
+    def _validate_probability_lists(cls, value):
+        if any(score < 0.0 or score > 1.0 for score in value):
+            raise ValueError("probability-like values must be between 0 and 1")
+        return value
+
+    @field_validator("predictions")
+    @classmethod
+    def _validate_predictions(cls, value):
+        if any(prediction not in {0, 1} for prediction in value):
+            raise ValueError("predictions must only contain 0 or 1")
         return value
 
 

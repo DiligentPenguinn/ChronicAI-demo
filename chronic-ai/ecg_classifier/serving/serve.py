@@ -5,13 +5,16 @@ Loads MedSigLIP (google/medsiglip-448) + MoE/MLP classifier checkpoint
 and serves predictions via HTTP.
 
 Routes:
-  - POST /predict   — classify a base64-encoded ECG image
+  - POST /predict      — classify a base64-encoded ECG image
+  - POST /embed/image  — return the MedSigLIP image embedding
+  - POST /score        — run image -> MedSigLIP -> classifier scoring
   - GET  /health    — liveness / readiness check
 
 The model checkpoint is resolved in this order:
   1. AIP_STORAGE_URI env var (set automatically by Vertex AI)
-  2. CHECKPOINT_PATH env var (any other platform / local dev)
-  3. Default path relative to this script
+  2. CLASSIFIER_CKPT_PATH env var
+  3. CHECKPOINT_PATH env var (backward compatibility)
+  4. Default path relative to this script
 
 Port is resolved as: PORT → AIP_HTTP_PORT → 8080.
 """
@@ -29,7 +32,7 @@ from typing import Any, Optional
 import numpy as np
 import torch
 import torch.nn as nn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from pydantic import BaseModel
 from PIL import Image
 
@@ -203,6 +206,7 @@ _classes: list[str] = []
 _threshold: float = 0.5
 _model_id = ""
 _embed_dim = 0
+_num_experts = 0
 
 
 def _resolve_checkpoint_path() -> Path:
@@ -211,8 +215,9 @@ def _resolve_checkpoint_path() -> Path:
 
     Priority:
     1. AIP_STORAGE_URI (set by Vertex AI) — the GCS model artifact directory
-    2. CHECKPOINT_PATH env var (local dev fallback)
-    3. Default path relative to this script
+    2. CLASSIFIER_CKPT_PATH env var
+    3. CHECKPOINT_PATH env var (local dev fallback)
+    4. Default path relative to this script
     """
     # Vertex AI mounts GCS artifacts here
     storage_uri = os.environ.get("AIP_STORAGE_URI", "").strip()
@@ -226,6 +231,10 @@ def _resolve_checkpoint_path() -> Path:
                 return pt_files[0]
 
     # Local fallback
+    local_path = os.environ.get("CLASSIFIER_CKPT_PATH", "").strip()
+    if local_path:
+        return Path(local_path)
+
     local_path = os.environ.get("CHECKPOINT_PATH", "").strip()
     if local_path:
         return Path(local_path)
@@ -238,7 +247,7 @@ def _resolve_checkpoint_path() -> Path:
 def load_models():
     """Load MedSigLIP embedder + classifier at startup."""
     global _embedder, _processor, _classifier, _classifier_type
-    global _device, _classes, _threshold, _model_id, _embed_dim
+    global _device, _classes, _threshold, _model_id, _embed_dim, _num_experts
 
     from transformers import AutoImageProcessor, AutoModel
 
@@ -282,12 +291,16 @@ def load_models():
     _embedder = embedder
     _processor = processor
     _classifier = classifier
-    _classifier_type = classifier_type
+    _classifier_type = {
+        "moe": "moe_classifier",
+        "mlp": "mlp_classifier",
+    }.get(classifier_type, classifier_type)
     _device = device
     _classes = [str(c) for c in classes]
     _threshold = float(ckpt.get("threshold", 0.5))
     _model_id = model_id
     _embed_dim = int(ckpt["embed_dim"])
+    _num_experts = int(ckpt.get("num_experts") or 0)
 
     logger.info(
         "Models loaded: classifier_type=%s classes=%s embed_dim=%s threshold=%.3f device=%s",
@@ -325,6 +338,34 @@ class PredictResponse(BaseModel):
     threshold: float
 
 
+class EmbedImageResponse(BaseModel):
+    embedding: list[float]
+
+
+class ScoreResult(BaseModel):
+    index: int
+    embedding: list[float]
+    scores: list[float]
+    scores_by_class: dict[str, float]
+    probabilities: list[float]
+    probabilities_by_class: dict[str, float]
+    predictions: list[int]
+    predictions_by_class: dict[str, int]
+    predicted_labels: list[str]
+    gate_weights: list[float]
+
+
+class ScoreResponse(BaseModel):
+    classifier_type: str
+    medsiglip_model_id: str
+    device: str
+    classes: list[str]
+    threshold: float
+    num_experts: int
+    results: list[ScoreResult]
+    scoring_mode: str
+
+
 @app.get("/health")
 def health():
     """Health check for Vertex AI."""
@@ -335,6 +376,88 @@ def health():
     }
 
 
+def _ensure_models_loaded() -> None:
+    if _embedder is None or _processor is None or _classifier is None:
+        raise HTTPException(status_code=503, detail="Models not loaded yet.")
+
+
+def _load_image_from_bytes(raw: bytes) -> Image.Image:
+    if not raw:
+        raise HTTPException(status_code=400, detail="Image file is empty.")
+    try:
+        return Image.open(io.BytesIO(raw)).convert("RGB")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid image: {exc}") from exc
+
+
+def _decode_base64_image(payload: str) -> Image.Image:
+    encoded = (payload or "").strip()
+    if not encoded:
+        raise HTTPException(status_code=400, detail="image_base64 is empty.")
+    if encoded.startswith("data:") and "," in encoded:
+        encoded = encoded.split(",", 1)[1]
+    try:
+        raw = base64.b64decode(encoded)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid image payload: {exc}") from exc
+    return _load_image_from_bytes(raw)
+
+
+def _embed_image(image: Image.Image) -> torch.Tensor:
+    inputs = _processor(images=[image], return_tensors="pt")
+    inputs = {k: v.to(_device) for k, v in inputs.items()}
+    image_features = extract_features(_embedder.get_image_features(**inputs))
+
+    if image_features.ndim != 2 or image_features.shape[0] != 1:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unexpected embedding shape: {tuple(image_features.shape)}",
+        )
+    if int(image_features.shape[1]) != _embed_dim:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Embedding dim mismatch: expected={_embed_dim}, got={int(image_features.shape[1])}",
+        )
+    return image_features
+
+
+def _score_embedding(image_features: torch.Tensor) -> ScoreResult:
+    logits_output = _classifier(image_features)
+    gate_weights: list[float] = []
+    if isinstance(logits_output, tuple):
+        logits = logits_output[0]
+        if len(logits_output) > 1:
+            gate_weights = logits_output[1].squeeze(0).detach().cpu().tolist()
+    else:
+        logits = logits_output
+
+    raw_scores = logits.squeeze(0).detach().cpu().tolist()
+    probabilities = torch.sigmoid(logits).squeeze(0).detach().cpu().tolist()
+    predictions = [1 if float(probability) >= _threshold else 0 for probability in probabilities]
+    predicted_labels = [
+        label for label, prediction in zip(_classes, predictions) if prediction
+    ]
+
+    return ScoreResult(
+        index=0,
+        embedding=[float(value) for value in image_features.squeeze(0).detach().cpu().tolist()],
+        scores=[float(value) for value in raw_scores],
+        scores_by_class={
+            label: float(value) for label, value in zip(_classes, raw_scores)
+        },
+        probabilities=[float(value) for value in probabilities],
+        probabilities_by_class={
+            label: float(value) for label, value in zip(_classes, probabilities)
+        },
+        predictions=[int(value) for value in predictions],
+        predictions_by_class={
+            label: int(value) for label, value in zip(_classes, predictions)
+        },
+        predicted_labels=predicted_labels,
+        gate_weights=[float(value) for value in gate_weights],
+    )
+
+
 @app.post("/predict", response_model=PredictResponse)
 @torch.no_grad()
 def predict(request: PredictRequest):
@@ -343,41 +466,13 @@ def predict(request: PredictRequest):
 
     Accepts a base64-encoded image, returns per-class sigmoid scores.
     """
-    if _embedder is None or _processor is None or _classifier is None:
-        raise HTTPException(status_code=503, detail="Models not loaded yet.")
+    _ensure_models_loaded()
 
     start = time.perf_counter()
-
-    # Decode image
-    payload = (request.image_base64 or "").strip()
-    if not payload:
-        raise HTTPException(status_code=400, detail="image_base64 is empty.")
-    if payload.startswith("data:") and "," in payload:
-        payload = payload.split(",", 1)[1]
-    try:
-        raw = base64.b64decode(payload)
-        image = Image.open(io.BytesIO(raw)).convert("RGB")
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Invalid image: {exc}")
-
-    # Embed with MedSigLIP
-    inputs = _processor(images=[image], return_tensors="pt")
-    inputs = {k: v.to(_device) for k, v in inputs.items()}
-    image_features = extract_features(_embedder.get_image_features(**inputs))
-
-    if image_features.ndim != 2 or image_features.shape[0] != 1:
-        raise HTTPException(status_code=500, detail=f"Unexpected embedding shape: {tuple(image_features.shape)}")
-    if int(image_features.shape[1]) != _embed_dim:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Embedding dim mismatch: expected={_embed_dim}, got={int(image_features.shape[1])}",
-        )
-
-    # Classify
-    logits_output = _classifier(image_features)
-    logits = logits_output[0] if isinstance(logits_output, tuple) else logits_output
-    probs = torch.sigmoid(logits).squeeze(0).detach().cpu().tolist()
-    scores = [float(s) for s in probs]
+    image = _decode_base64_image(request.image_base64)
+    image_features = _embed_image(image)
+    scored = _score_embedding(image_features)
+    scores = scored.probabilities
 
     scores_by_class = {label: score for label, score in zip(_classes, scores)}
     predicted_labels = [
@@ -400,6 +495,62 @@ def predict(request: PredictRequest):
         scores_by_class=scores_by_class,
         predicted_labels=predicted_labels,
         threshold=_threshold,
+    )
+
+
+@app.post("/embed/image", response_model=EmbedImageResponse)
+@torch.no_grad()
+async def embed_image(file: UploadFile = File(...)):
+    """Return the MedSigLIP image embedding for one uploaded file."""
+    _ensure_models_loaded()
+
+    raw = await file.read()
+    image = _load_image_from_bytes(raw)
+    image_features = _embed_image(image)
+    embedding = [float(value) for value in image_features.squeeze(0).detach().cpu().tolist()]
+
+    logger.info(
+        "embed/image: filename=%s embed_dim=%s",
+        file.filename or "",
+        len(embedding),
+    )
+
+    return EmbedImageResponse(embedding=embedding)
+
+
+@app.post("/score", response_model=ScoreResponse)
+@torch.no_grad()
+async def score(file: UploadFile = File(...)):
+    """Score one uploaded ECG image via MedSigLIP embedding + classifier head."""
+    _ensure_models_loaded()
+
+    start = time.perf_counter()
+    raw = await file.read()
+    image = _load_image_from_bytes(raw)
+    image_features = _embed_image(image)
+    result_row = _score_embedding(image_features)
+
+    elapsed_ms = (time.perf_counter() - start) * 1000
+    logger.info(
+        "score: filename=%s predicted=%s top3=%s elapsed_ms=%.1f",
+        file.filename or "",
+        result_row.predicted_labels,
+        sorted(result_row.probabilities_by_class.items(), key=lambda item: item[1], reverse=True)[:3],
+        elapsed_ms,
+    )
+
+    return ScoreResponse(
+        classifier_type=_classifier_type,
+        medsiglip_model_id=_model_id,
+        device=_device,
+        classes=list(_classes),
+        threshold=float(_threshold),
+        num_experts=int(_num_experts),
+        results=[result_row],
+        scoring_mode=(
+            "image -> MedSigLIP image embedding -> "
+            f"{_classifier_type} logits -> sigmoid probabilities -> thresholded predictions"
+        ),
     )
 
 

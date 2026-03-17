@@ -12,7 +12,7 @@ Supported remote pipelines:
 
 This service only makes an HTTP call; it supports both of the protocols used in this repo:
   - POST /predict with JSON {"image_base64": "..."}
-  - POST /score with multipart form-data and prompt texts
+  - POST /score with multipart form-data and one image file
   - POST /embed/image with multipart form-data and image file
 
 Supported auth types (via ECG_CLASSIFIER_AUTH_TYPE):
@@ -27,8 +27,9 @@ from __future__ import annotations
 
 import base64
 from functools import lru_cache
-import json
 import logging
+import math
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -79,7 +80,7 @@ class ECGClassifierService:
 
         Supported modes:
         - predict_json: POST JSON {"image_base64": "..."} to /predict or Vertex :predict
-        - score_multipart: POST multipart image+texts to /score
+        - score_multipart: POST multipart image file to /score
         - embed_image_multipart: POST multipart file upload to /embed/image
         """
         base_url = self._get_endpoint_url().rstrip("/")
@@ -111,18 +112,13 @@ class ECGClassifierService:
         except Exception as exc:
             raise RuntimeError(f"Invalid ECG image payload: {exc}") from exc
 
-    def _build_score_request_data(self) -> dict[str, str]:
-        return {
-            "normalize": "true",
-            # The MedSigLIP /score endpoint expects `texts` as a JSON string
-            # inside multipart form-data, not as repeated form fields.
-            "texts": json.dumps([prompt for _, prompt in ECG_LABEL_PROMPTS]),
-        }
-
     def _resolve_checkpoint_path(self) -> Path:
         configured = str(getattr(settings, "ecg_classifier_checkpoint_path", "") or "").strip()
         if configured:
             return Path(configured).expanduser()
+        env_override = os.environ.get("CLASSIFIER_CKPT_PATH", "").strip()
+        if env_override:
+            return Path(env_override).expanduser()
         return (
             Path(__file__).resolve().parents[3]
             / "ecg_classifier"
@@ -138,10 +134,244 @@ class ECGClassifierService:
             or "google/medsiglip-448"
         )
 
-    def _normalize_score_response(self, result: dict[str, Any]) -> dict[str, Any]:
-        if not isinstance(result, dict):
-            raise RuntimeError("ECG classifier endpoint returned a non-object response.")
+    def _default_classes(self) -> list[str]:
+        return [label for label, _ in ECG_LABEL_PROMPTS]
 
+    def _resolve_classes(self, result: dict[str, Any], row: dict[str, Any] | None = None) -> list[str]:
+        for candidate in (result.get("classes"), (row or {}).get("classes")):
+            if isinstance(candidate, list) and candidate:
+                return [str(item) for item in candidate]
+
+        for key in ("scores_by_class", "probabilities_by_class", "predictions_by_class"):
+            candidate = (row or {}).get(key)
+            if isinstance(candidate, dict) and candidate:
+                return [str(label) for label in candidate.keys()]
+
+        return self._default_classes()
+
+    def _coerce_float_list(
+        self,
+        raw_values: Any,
+        *,
+        field_name: str,
+        allow_empty: bool = False,
+    ) -> list[float]:
+        if raw_values is None:
+            if allow_empty:
+                return []
+            raise RuntimeError(f"ECG classifier endpoint returned missing {field_name}.")
+        if not isinstance(raw_values, list):
+            raise RuntimeError(f"ECG classifier endpoint returned non-list {field_name}.")
+        if not raw_values and not allow_empty:
+            raise RuntimeError(f"ECG classifier endpoint returned empty {field_name}.")
+        try:
+            return [float(value) for value in raw_values]
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"ECG classifier endpoint returned non-numeric {field_name}."
+            ) from exc
+
+    def _coerce_binary_list(
+        self,
+        raw_values: Any,
+        *,
+        field_name: str,
+        allow_empty: bool = False,
+    ) -> list[int]:
+        if raw_values is None:
+            if allow_empty:
+                return []
+            raise RuntimeError(f"ECG classifier endpoint returned missing {field_name}.")
+        if not isinstance(raw_values, list):
+            raise RuntimeError(f"ECG classifier endpoint returned non-list {field_name}.")
+        if not raw_values and not allow_empty:
+            raise RuntimeError(f"ECG classifier endpoint returned empty {field_name}.")
+
+        normalized: list[int] = []
+        for value in raw_values:
+            try:
+                int_value = int(value)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"ECG classifier endpoint returned non-binary {field_name}."
+                ) from exc
+            if int_value not in {0, 1}:
+                raise RuntimeError(
+                    f"ECG classifier endpoint returned non-binary {field_name}."
+                )
+            normalized.append(int_value)
+        return normalized
+
+    def _build_float_mapping(
+        self,
+        raw_mapping: Any,
+        *,
+        classes: list[str],
+        fallback_values: list[float],
+    ) -> dict[str, float]:
+        if isinstance(raw_mapping, dict) and raw_mapping:
+            try:
+                return {
+                    label: float(raw_mapping[label])
+                    for label in classes
+                    if label in raw_mapping
+                }
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    "ECG classifier endpoint returned non-numeric per-class values."
+                ) from exc
+        return {
+            label: float(value)
+            for label, value in zip(classes, fallback_values)
+        }
+
+    def _build_binary_mapping(
+        self,
+        raw_mapping: Any,
+        *,
+        classes: list[str],
+        fallback_values: list[int],
+    ) -> dict[str, int]:
+        if isinstance(raw_mapping, dict) and raw_mapping:
+            normalized: dict[str, int] = {}
+            for label in classes:
+                if label not in raw_mapping:
+                    continue
+                try:
+                    int_value = int(raw_mapping[label])
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError(
+                        "ECG classifier endpoint returned non-binary per-class predictions."
+                    ) from exc
+                if int_value not in {0, 1}:
+                    raise RuntimeError(
+                        "ECG classifier endpoint returned non-binary per-class predictions."
+                    )
+                normalized[label] = int_value
+            if normalized:
+                return normalized
+        return {
+            label: int(value)
+            for label, value in zip(classes, fallback_values)
+        }
+
+    def _validate_vector_length(
+        self,
+        values: list[Any],
+        *,
+        classes: list[str],
+        field_name: str,
+    ) -> None:
+        if len(values) != len(classes):
+            raise RuntimeError(
+                "ECG classifier endpoint returned wrong score vector length: "
+                f"expected={len(classes)} got={len(values)} ({field_name})"
+            )
+
+    def _sigmoid(self, value: float) -> float:
+        if value >= 0:
+            exp_value = math.exp(-value)
+            return 1.0 / (1.0 + exp_value)
+        exp_value = math.exp(value)
+        return exp_value / (1.0 + exp_value)
+
+    def _resolve_probabilities(self, raw_probabilities: Any, *, scores: list[float]) -> list[float]:
+        if isinstance(raw_probabilities, list) and raw_probabilities:
+            probabilities = self._coerce_float_list(
+                raw_probabilities,
+                field_name="probabilities",
+            )
+            if any(probability < 0.0 or probability > 1.0 for probability in probabilities):
+                raise RuntimeError(
+                    "ECG classifier endpoint returned probabilities outside [0, 1]."
+                )
+            return probabilities
+
+        if scores and all(0.0 <= score <= 1.0 for score in scores):
+            return [float(score) for score in scores]
+        return [self._sigmoid(score) for score in scores]
+
+    def _normalize_moe_score_response(self, result: dict[str, Any]) -> dict[str, Any]:
+        rows = result.get("results")
+        if not isinstance(rows, list) or not rows:
+            raise RuntimeError("ECG classifier endpoint returned missing or empty results.")
+
+        first_row = rows[0]
+        if not isinstance(first_row, dict):
+            raise RuntimeError("ECG classifier endpoint returned a non-object result row.")
+
+        classes = self._resolve_classes(result, first_row)
+        scores = self._coerce_float_list(first_row.get("scores"), field_name="scores")
+        self._validate_vector_length(scores, classes=classes, field_name="scores")
+
+        probabilities = self._resolve_probabilities(
+            first_row.get("probabilities"),
+            scores=scores,
+        )
+        self._validate_vector_length(
+            probabilities,
+            classes=classes,
+            field_name="probabilities",
+        )
+
+        threshold = float(result.get("threshold", first_row.get("threshold", DEFAULT_SCORE_THRESHOLD)))
+        raw_predictions = first_row.get("predictions")
+        if isinstance(raw_predictions, list) and raw_predictions:
+            predictions = self._coerce_binary_list(raw_predictions, field_name="predictions")
+        else:
+            predictions = [1 if probability >= threshold else 0 for probability in probabilities]
+        self._validate_vector_length(predictions, classes=classes, field_name="predictions")
+
+        raw_predicted_labels = first_row.get("predicted_labels")
+        if isinstance(raw_predicted_labels, list):
+            predicted_labels = [str(item) for item in raw_predicted_labels if str(item).strip()]
+        else:
+            predicted_labels = [
+                label for label, predicted in zip(classes, predictions)
+                if predicted
+            ]
+
+        return {
+            "classifier_type": str(result.get("classifier_type") or "moe_classifier"),
+            "checkpoint_path": str(result.get("checkpoint_path") or "remote-score-endpoint"),
+            "medsiglip_model_id": self._resolve_medsiglip_model_id(result),
+            "device": str(result.get("device") or ""),
+            "classes": classes,
+            "scores": scores,
+            "scores_by_class": self._build_float_mapping(
+                first_row.get("scores_by_class"),
+                classes=classes,
+                fallback_values=scores,
+            ),
+            "probabilities": probabilities,
+            "probabilities_by_class": self._build_float_mapping(
+                first_row.get("probabilities_by_class"),
+                classes=classes,
+                fallback_values=probabilities,
+            ),
+            "predictions": predictions,
+            "predictions_by_class": self._build_binary_mapping(
+                first_row.get("predictions_by_class"),
+                classes=classes,
+                fallback_values=predictions,
+            ),
+            "predicted_labels": predicted_labels,
+            "threshold": threshold,
+            "embedding": self._coerce_float_list(
+                first_row.get("embedding"),
+                field_name="embedding",
+                allow_empty=True,
+            ),
+            "gate_weights": self._coerce_float_list(
+                first_row.get("gate_weights"),
+                field_name="gate_weights",
+                allow_empty=True,
+            ),
+            "num_experts": int(result.get("num_experts") or 0),
+            "scoring_mode": str(result.get("scoring_mode") or ""),
+        }
+
+    def _normalize_legacy_score_response(self, result: dict[str, Any]) -> dict[str, Any]:
         raw_scores = result.get("scores")
         if not isinstance(raw_scores, list) or not raw_scores:
             raise RuntimeError("ECG classifier endpoint returned missing or empty scores.")
@@ -150,88 +380,132 @@ class ECGClassifierService:
         if not isinstance(first_row, list) or not first_row:
             raise RuntimeError("ECG classifier endpoint returned an empty score row.")
 
-        classes = [label for label, _ in ECG_LABEL_PROMPTS]
-        if len(first_row) != len(classes):
-            raise RuntimeError(
-                "ECG classifier endpoint returned wrong score vector length: "
-                f"expected={len(classes)} got={len(first_row)}"
-            )
+        classes = self._default_classes()
+        scores = self._coerce_float_list(first_row, field_name="scores")
+        self._validate_vector_length(scores, classes=classes, field_name="scores")
+        probabilities = self._resolve_probabilities(result.get("probabilities"), scores=scores)
+        self._validate_vector_length(
+            probabilities,
+            classes=classes,
+            field_name="probabilities",
+        )
 
-        try:
-            scores = [float(value) for value in first_row]
-        except (TypeError, ValueError) as exc:
-            raise RuntimeError(
-                "ECG classifier endpoint returned non-numeric scores."
-            ) from exc
-
-        scores_by_class = {
-            label: score for label, score in zip(classes, scores)
-        }
+        threshold = float(result.get("threshold", DEFAULT_SCORE_THRESHOLD))
+        predictions = [1 if probability >= threshold else 0 for probability in probabilities]
         predicted_labels = [
-            label for label, score in zip(classes, scores)
-            if score >= DEFAULT_SCORE_THRESHOLD
+            label for label, predicted in zip(classes, predictions)
+            if predicted
         ]
 
         return {
-            "classifier_type": "medsiglip_similarity",
-            "checkpoint_path": "remote-score-endpoint",
+            "classifier_type": str(result.get("classifier_type") or "remote-score-endpoint"),
+            "checkpoint_path": str(result.get("checkpoint_path") or "remote-score-endpoint"),
             "medsiglip_model_id": self._resolve_medsiglip_model_id(result),
+            "device": str(result.get("device") or ""),
             "classes": classes,
             "scores": scores,
-            "scores_by_class": scores_by_class,
+            "scores_by_class": self._build_float_mapping(
+                result.get("scores_by_class"),
+                classes=classes,
+                fallback_values=scores,
+            ),
+            "probabilities": probabilities,
+            "probabilities_by_class": self._build_float_mapping(
+                result.get("probabilities_by_class"),
+                classes=classes,
+                fallback_values=probabilities,
+            ),
+            "predictions": predictions,
+            "predictions_by_class": self._build_binary_mapping(
+                result.get("predictions_by_class"),
+                classes=classes,
+                fallback_values=predictions,
+            ),
             "predicted_labels": predicted_labels,
-            "threshold": DEFAULT_SCORE_THRESHOLD,
+            "threshold": threshold,
+            "embedding": [],
+            "gate_weights": [],
+            "num_experts": int(result.get("num_experts") or 0),
+            "scoring_mode": str(result.get("scoring_mode") or ""),
         }
+
+    def _normalize_score_response(self, result: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(result, dict):
+            raise RuntimeError("ECG classifier endpoint returned a non-object response.")
+        if isinstance(result.get("results"), list):
+            return self._normalize_moe_score_response(result)
+        return self._normalize_legacy_score_response(result)
 
     def _normalize_predict_response(self, result: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(result, dict):
             raise RuntimeError("ECG classifier endpoint returned a non-object response.")
 
-        raw_scores = result.get("scores")
-        if not isinstance(raw_scores, list) or not raw_scores:
-            raise RuntimeError("ECG classifier endpoint returned missing or empty scores.")
+        scores = self._coerce_float_list(result.get("scores"), field_name="scores")
+        classes = self._resolve_classes(result)
+        self._validate_vector_length(scores, classes=classes, field_name="scores")
 
-        try:
-            scores = [float(value) for value in raw_scores]
-        except (TypeError, ValueError) as exc:
-            raise RuntimeError(
-                "ECG classifier endpoint returned non-numeric scores."
-            ) from exc
+        probabilities = self._resolve_probabilities(result.get("probabilities"), scores=scores)
+        self._validate_vector_length(
+            probabilities,
+            classes=classes,
+            field_name="probabilities",
+        )
 
-        raw_classes = result.get("classes")
-        if isinstance(raw_classes, list) and raw_classes:
-            classes = [str(item) for item in raw_classes]
+        threshold = float(result.get("threshold", DEFAULT_SCORE_THRESHOLD))
+        raw_predictions = result.get("predictions")
+        if isinstance(raw_predictions, list) and raw_predictions:
+            predictions = self._coerce_binary_list(raw_predictions, field_name="predictions")
         else:
-            classes = [label for label, _ in ECG_LABEL_PROMPTS]
+            predictions = [1 if probability >= threshold else 0 for probability in probabilities]
+        self._validate_vector_length(predictions, classes=classes, field_name="predictions")
 
-        if len(scores) != len(classes):
-            raise RuntimeError(
-                "ECG classifier endpoint returned wrong score vector length: "
-                f"expected={len(classes)} got={len(scores)}"
-            )
-
-        scores_by_class = {
-            label: score for label, score in zip(classes, scores)
-        }
         predicted_labels = result.get("predicted_labels")
         if isinstance(predicted_labels, list):
             normalized_predicted_labels = [str(item) for item in predicted_labels]
         else:
-            threshold = float(result.get("threshold", DEFAULT_SCORE_THRESHOLD))
             normalized_predicted_labels = [
-                label for label, score in zip(classes, scores)
-                if score >= threshold
+                label for label, predicted in zip(classes, predictions)
+                if predicted
             ]
 
         return {
             "classifier_type": str(result.get("classifier_type") or "remote-predict-endpoint"),
             "checkpoint_path": str(result.get("checkpoint_path") or "remote-predict-endpoint"),
             "medsiglip_model_id": self._resolve_medsiglip_model_id(result),
+            "device": str(result.get("device") or ""),
             "classes": classes,
             "scores": scores,
-            "scores_by_class": scores_by_class,
+            "scores_by_class": self._build_float_mapping(
+                result.get("scores_by_class"),
+                classes=classes,
+                fallback_values=scores,
+            ),
+            "probabilities": probabilities,
+            "probabilities_by_class": self._build_float_mapping(
+                result.get("probabilities_by_class"),
+                classes=classes,
+                fallback_values=probabilities,
+            ),
+            "predictions": predictions,
+            "predictions_by_class": self._build_binary_mapping(
+                result.get("predictions_by_class"),
+                classes=classes,
+                fallback_values=predictions,
+            ),
             "predicted_labels": normalized_predicted_labels,
-            "threshold": float(result.get("threshold", DEFAULT_SCORE_THRESHOLD)),
+            "threshold": threshold,
+            "embedding": self._coerce_float_list(
+                result.get("embedding"),
+                field_name="embedding",
+                allow_empty=True,
+            ),
+            "gate_weights": self._coerce_float_list(
+                result.get("gate_weights"),
+                field_name="gate_weights",
+                allow_empty=True,
+            ),
+            "num_experts": int(result.get("num_experts") or 0),
+            "scoring_mode": str(result.get("scoring_mode") or ""),
         }
 
     def _normalize_embed_image_response(self, result: dict[str, Any]) -> dict[str, Any]:
@@ -281,8 +555,7 @@ class ECGClassifierService:
         return await client.post(
             endpoint_url,
             headers=multipart_headers,
-            data=self._build_score_request_data(),
-            files=[("files", ("ecg-upload.png", image_bytes, "image/png"))],
+            files=[("file", ("ecg-upload.png", image_bytes, "image/png"))],
         )
 
     async def _post_embed_image_multipart(
@@ -324,29 +597,59 @@ class ECGClassifierService:
         with torch.no_grad():
             input_tensor = torch.tensor([embedding], dtype=torch.float32)
             logits_output = classifier_state["model"](input_tensor)
-            logits = logits_output[0] if isinstance(logits_output, tuple) else logits_output
-            scores = torch.sigmoid(logits).detach().cpu().view(-1).tolist()
+            gate_weights = []
+            if isinstance(logits_output, tuple):
+                logits = logits_output[0]
+                if len(logits_output) > 1:
+                    gate_weights = logits_output[1].detach().cpu().view(-1).tolist()
+            else:
+                logits = logits_output
+            scores = logits.detach().cpu().view(-1).tolist()
+            probabilities = torch.sigmoid(logits).detach().cpu().view(-1).tolist()
 
         classes = list(classifier_state["classes"])
         scores_by_class = {
             label: float(score)
             for label, score in zip(classes, scores)
         }
+        probabilities_by_class = {
+            label: float(probability)
+            for label, probability in zip(classes, probabilities)
+        }
         threshold = float(classifier_state["threshold"])
+        predictions = [
+            1 if probability >= threshold else 0
+            for probability in probabilities
+        ]
         predicted_labels = [
-            label for label, score in zip(classes, scores)
-            if score >= threshold
+            label for label, predicted in zip(classes, predictions)
+            if predicted
         ]
 
         return {
-            "classifier_type": str(classifier_state["model_type"]),
+            "classifier_type": str(classifier_state["classifier_type"]),
             "checkpoint_path": f"local-checkpoint:{Path(classifier_state['checkpoint_path']).name}",
             "medsiglip_model_id": medsiglip_model_id,
+            "device": "cpu",
             "classes": classes,
             "scores": [float(score) for score in scores],
             "scores_by_class": scores_by_class,
+            "probabilities": [float(probability) for probability in probabilities],
+            "probabilities_by_class": probabilities_by_class,
+            "predictions": predictions,
+            "predictions_by_class": {
+                label: int(prediction)
+                for label, prediction in zip(classes, predictions)
+            },
             "predicted_labels": predicted_labels,
             "threshold": threshold,
+            "embedding": [float(value) for value in embedding],
+            "gate_weights": [float(weight) for weight in gate_weights],
+            "num_experts": int(classifier_state["num_experts"]),
+            "scoring_mode": (
+                "image -> MedSigLIP image embedding -> local classifier logits "
+                "-> sigmoid probabilities -> thresholded predictions"
+            ),
         }
 
     async def _get_auth_headers(self) -> dict[str, str]:
@@ -669,6 +972,11 @@ def _load_local_classifier_state(checkpoint_path: str) -> dict[str, Any]:
     classes = [str(item) for item in (ckpt.get("classes") or [])]
     if not classes:
         classes = [label for label, _ in ECG_LABEL_PROMPTS]
+    num_experts = int(ckpt.get("num_experts") or 0)
+    classifier_type = {
+        "moe": "moe_classifier",
+        "mlp": "mlp_classifier",
+    }.get(model_type, str(model_type))
 
     configured_threshold = getattr(settings, "ecg_classifier_threshold", DEFAULT_SCORE_THRESHOLD)
     threshold = float(
@@ -683,8 +991,10 @@ def _load_local_classifier_state(checkpoint_path: str) -> dict[str, Any]:
     return {
         "model": model,
         "model_type": model_type,
+        "classifier_type": classifier_type,
         "classes": classes,
         "threshold": threshold,
         "embed_dim": embed_dim,
+        "num_experts": num_experts,
         "checkpoint_path": str(path),
     }
