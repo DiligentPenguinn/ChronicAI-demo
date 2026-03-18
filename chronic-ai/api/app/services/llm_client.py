@@ -48,6 +48,7 @@ class LLMClient:
         self.timeout = httpx.Timeout(300.0, connect=60.0)
         self._loaded_model: Optional[str] = None
         self._model_locks: dict[str, asyncio.Lock] = {}
+        self._runtime_disabled_image_models: dict[str, str] = {}
 
         self._provider = (settings.llm_provider or "vertex").strip().lower()
         self._embedding_provider = (settings.embedding_provider or "hash").strip().lower()
@@ -87,6 +88,10 @@ class LLMClient:
         if not effective_model:
             return False, "No OpenAI-compatible model is configured for image requests."
 
+        runtime_reason = self._runtime_disabled_image_reason(effective_model)
+        if runtime_reason:
+            return False, runtime_reason
+
         allowlist = self._normalized_image_model_allowlist()
         if not allowlist:
             return False, (
@@ -101,6 +106,25 @@ class LLMClient:
             )
 
         return True, ""
+
+    def _runtime_disabled_image_reason(self, model: str) -> str:
+        normalized = (model or "").strip().lower()
+        if not normalized:
+            return ""
+        return self._runtime_disabled_image_models.get(normalized, "")
+
+    def _disable_runtime_images_for_model(self, model: str, provider_error: str = "") -> None:
+        normalized = (model or "").strip().lower()
+        if not normalized:
+            return
+        reason = (
+            "This OpenAI-compatible model previously rejected the multimodal chat payload "
+            "for image uploads in the current server process."
+        )
+        error_text = (provider_error or "").strip()
+        if error_text:
+            reason = f"{reason} Provider error: {error_text[:180]}"
+        self._runtime_disabled_image_models[normalized] = reason
 
     async def generate(
         self,
@@ -225,10 +249,15 @@ class LLMClient:
                                     if response.status_code >= 400:
                                         fallback_error_text = self._extract_http_error(response)
                                         if images and self._is_role_alternation_error(fallback_error_text):
+                                            self._disable_runtime_images_for_model(
+                                                model=model,
+                                                provider_error=fallback_error_text,
+                                            )
                                             raise RuntimeError(
                                                 "OpenAI-compatible multimodal request was rejected by the provider "
                                                 "after removing the system role; this backend likely does not accept "
-                                                "the current image chat payload for this model."
+                                                f"the current image chat payload for this model. Provider error: "
+                                                f"{fallback_error_text[:180] or 'No response'}"
                                             )
                                 response.raise_for_status()
                             return self._extract_vertex_text(response.json())

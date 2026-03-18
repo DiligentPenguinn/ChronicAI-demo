@@ -42,6 +42,31 @@ def test_openai_transport_retry_delay_backoff_cap(monkeypatch):
     assert llm_client_module.LLMClient._openai_compatible_transport_retry_delay_seconds(4) == 3.0
 
 
+def test_openai_can_use_images_honors_runtime_disable(monkeypatch):
+    client = llm_client_module.LLMClient()
+
+    monkeypatch.setattr(llm_client_module.settings, "llm_provider", "openai_compatible", raising=False)
+    monkeypatch.setattr(
+        llm_client_module.settings,
+        "openai_compatible_image_models",
+        ["google/medgemma-4b-it"],
+        raising=False,
+    )
+
+    enabled, reason = client.can_use_images("google/medgemma-4b-it")
+    assert enabled is True
+    assert reason == ""
+
+    client._disable_runtime_images_for_model(
+        "google/medgemma-4b-it",
+        "roles must alternate",
+    )
+    enabled, reason = client.can_use_images("google/medgemma-4b-it")
+    assert enabled is False
+    assert "previously rejected the multimodal chat payload" in reason
+    assert "roles must alternate" in reason
+
+
 def test_doctor_graph_retry_config_forces_single_attempt_with_openai_provider(monkeypatch):
     monkeypatch.setattr(doctor_graph.settings, "llm_provider", "openai_compatible", raising=False)
     monkeypatch.setattr(doctor_graph.settings, "llm_retry_max_attempts", 5, raising=False)
@@ -89,3 +114,18 @@ async def test_medical_reasoning_node_uses_single_graph_retry_with_openai_provid
     }
     await doctor_graph.medical_reasoning_node(state)
     assert captured["max_attempts"] == 1
+
+
+def test_classify_llm_error_reports_openai_multimodal_payload_rejection():
+    from app.services import llm as llm_module
+
+    message = (
+        "OpenAI-compatible multimodal request was rejected by the provider after removing "
+        "the system role; this backend likely does not accept the current image chat payload "
+        "for this model. Provider error: roles must alternate"
+    )
+
+    reason = llm_module._classify_llm_error(message)
+
+    assert "rejected image input for chat completions" in reason
+    assert "roles must alternate" in reason

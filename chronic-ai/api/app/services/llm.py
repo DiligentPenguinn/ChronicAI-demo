@@ -991,7 +991,8 @@ def _build_ecg_classifier_fallback_analysis(
 
 def _classify_llm_error(message: str) -> str:
     """Convert low-level LLM errors into backend diagnostic reason text."""
-    msg = (message or "").lower()
+    raw_message = (message or "").strip()
+    msg = raw_message.lower()
     if "notimplementederror" in msg:
         return "Server runtime does not support async subprocess execution for token retrieval."
     if "not found" in msg and "model" in msg:
@@ -1002,6 +1003,19 @@ def _classify_llm_error(message: str) -> str:
         return "The backend is not authorized to call the Vertex endpoint."
     if "timeout" in msg:
         return "The model request timed out."
+    if (
+        "multimodal request was rejected by the provider" in msg
+        or "image chat payload" in msg
+        or "roles must alternate" in msg
+    ):
+        provider_detail = raw_message
+        marker = "Provider error:"
+        if marker in raw_message:
+            provider_detail = raw_message.split(marker, 1)[1].strip()
+        return (
+            "The configured OpenAI-compatible model rejected image input for chat completions. "
+            f"Details: {provider_detail[:180]}"
+        )
     if "vertex ai error (400)" in msg or "invalid" in msg:
         return "The request payload was rejected by the model endpoint."
     if "cannot connect" in msg:
