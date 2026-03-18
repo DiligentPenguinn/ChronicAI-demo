@@ -89,6 +89,7 @@ async def health_check():
             "llm_provider": system_status.get("provider", settings.llm_provider),
             "llm": system_status.get("llm", False),
             "models": system_status.get("models", {}),
+            "capabilities": system_status.get("capabilities", {}),
             "message": system_status.get("message", "")
         }
     except Exception as e:

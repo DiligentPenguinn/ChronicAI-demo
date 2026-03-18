@@ -59,6 +59,7 @@ class Settings(BaseSettings):
     openai_compatible_chat_completions_path: str = "/chat/completions"
     openai_compatible_api_key: str = ""
     openai_compatible_model: str = ""
+    openai_compatible_image_models: List[str] = []
     openai_compatible_temperature: float = 0.2
     # Request timeout controls for OpenAI-compatible providers.
     # Some gateways time out around 60s; keep total timeout close to that.
@@ -144,11 +145,40 @@ class Settings(BaseSettings):
         # Ensure all origins are strings and strip trailing slashes
         return [str(o).rstrip("/") for o in origins if o]
 
+    @field_validator("openai_compatible_image_models", mode="before")
+    @classmethod
+    def parse_openai_compatible_image_models(cls, v: object) -> List[str]:
+        """Accept a JSON array string or a plain comma-separated string."""
+        if isinstance(v, str):
+            raw = v.strip()
+            if not raw:
+                return []
+            try:
+                values = json.loads(raw)
+            except json.JSONDecodeError:
+                values = [item.strip() for item in raw.split(",") if item.strip()]
+            else:
+                if isinstance(values, str):
+                    values = [values]
+        elif isinstance(v, list):
+            values = v
+        else:
+            return []
+
+        normalized: List[str] = []
+        for item in values:
+            text = str(item).strip()
+            if text:
+                normalized.append(text)
+        return normalized
+
     # Model Configuration
     medical_model: str = "alibayram/medgemma"
     # Optional dedicated model for upload-file AI analysis (especially image uploads).
     # If empty, upload analysis falls back to medical_model.
     upload_analysis_model: str = ""
+    enable_multimodal_upload_analysis: bool = True
+    enable_multimodal_medical_reasoning: bool = True
     # ECG classifier / MedSigLIP remote endpoint.
     # Supported endpoints:
     # - /predict      -> returns class scores directly

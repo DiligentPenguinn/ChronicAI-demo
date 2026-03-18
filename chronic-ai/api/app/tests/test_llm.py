@@ -67,6 +67,37 @@ class TestSystemHealth:
         assert "llm" in result
         assert result["status"] in ["healthy", "degraded", "unhealthy"]
 
+    @pytest.mark.asyncio
+    async def test_health_check_reports_multimodal_capabilities(self, monkeypatch):
+        from app.services import llm as llm_module
+
+        async def fake_health_check():
+            return True
+
+        async def fake_check_model_available(model):
+            return True
+
+        monkeypatch.setattr(llm_module.llm_client, "health_check", fake_health_check)
+        monkeypatch.setattr(llm_module.llm_client, "check_model_available", fake_check_model_available)
+        monkeypatch.setattr(llm_module.settings, "llm_provider", "openai_compatible", raising=False)
+        monkeypatch.setattr(llm_module.settings, "medical_model", "google/medgemma-27b-text-it", raising=False)
+        monkeypatch.setattr(llm_module.settings, "upload_analysis_model", "google/medgemma-4b-it", raising=False)
+        monkeypatch.setattr(
+            llm_module.settings,
+            "openai_compatible_image_models",
+            ["google/medgemma-4b-it"],
+            raising=False,
+        )
+        monkeypatch.setattr(llm_module.settings, "enable_multimodal_upload_analysis", True, raising=False)
+        monkeypatch.setattr(llm_module.settings, "enable_multimodal_medical_reasoning", True, raising=False)
+
+        result = await llm_module.check_system_health()
+
+        assert result["models"]["upload_analysis_model"] is True
+        assert result["capabilities"]["upload_analysis_images"]["enabled"] is True
+        assert result["capabilities"]["medical_reasoning_images"]["enabled"] is False
+        assert "not configured as an allowed" in result["capabilities"]["medical_reasoning_images"]["reason"]
+
 
 class TestPatientSummaryFormatting:
     """Regression tests for patient summary markdown normalization."""
@@ -523,6 +554,58 @@ Limitations:
         ]
 
     @pytest.mark.asyncio
+    async def test_text_upload_analysis_skips_multimodal_when_image_model_not_allowlisted(self, monkeypatch):
+        from app.services import llm as llm_module
+
+        calls = []
+
+        async def fake_get_cached_upload_analysis(cache_key):
+            return None
+
+        async def fake_store_upload_analysis_cache(cache_key, result):
+            return None
+
+        async def fake_check_model_available(model):
+            return True
+
+        async def fake_generate(**kwargs):
+            calls.append(kwargs)
+            return """
+Summary: Tài liệu cho thấy thông tin lâm sàng mức độ cơ bản từ OCR.
+Key findings:
+- Nội dung được phân tích từ văn bản OCR.
+Clinical significance: Cần đối chiếu với ảnh gốc nếu cần thêm chi tiết hình ảnh.
+Recommended follow-up:
+- Kiểm tra lại bản gốc nếu cần xác nhận.
+Urgency: low
+Confidence: medium
+Limitations:
+- Không dùng phân tích ảnh trực tiếp.
+"""
+
+        monkeypatch.setattr(llm_module, "_get_cached_upload_analysis", fake_get_cached_upload_analysis)
+        monkeypatch.setattr(llm_module, "_store_upload_analysis_cache", fake_store_upload_analysis_cache)
+        monkeypatch.setattr(llm_module.llm_client, "check_model_available", fake_check_model_available)
+        monkeypatch.setattr(llm_module.llm_client, "generate", fake_generate)
+        monkeypatch.setattr(llm_module.llm_client, "unload", fake_check_model_available)
+        monkeypatch.setattr(llm_module.settings, "llm_provider", "openai_compatible", raising=False)
+        monkeypatch.setattr(llm_module.settings, "upload_analysis_model", "google/medgemma-4b-it", raising=False)
+        monkeypatch.setattr(llm_module.settings, "openai_compatible_image_models", [], raising=False)
+        monkeypatch.setattr(llm_module.settings, "enable_multimodal_upload_analysis", True, raising=False)
+
+        result = await llm_module.analyze_uploaded_record(
+            record_type="notes",
+            title="Structured note",
+            extracted_text="Some OCR text",
+            image_base64="ZmFrZS1pbWFnZQ==",
+        )
+
+        assert result["status"] == "completed"
+        assert len(calls) == 1
+        assert calls[0]["images"] is None
+        assert any("Image analysis fallback was used:" in item for item in result["limitations"])
+
+    @pytest.mark.asyncio
     async def test_ecg_analysis_parses_sectioned_text_and_normalizes_scores(self, monkeypatch):
         from app.services import llm as llm_module
 
@@ -655,3 +738,105 @@ Limitations:
         assert result["urgency"] == "low"
         assert result["confidence"] == "high"
         assert any("dựng từ điểm bộ phân loại" in item for item in result["limitations"])
+
+    @pytest.mark.asyncio
+    async def test_ecg_analysis_keeps_classifier_result_when_multimodal_llm_fails(self, monkeypatch):
+        from app.services import llm as llm_module
+
+        async def fake_get_cached_upload_analysis(cache_key):
+            return None
+
+        async def fake_store_upload_analysis_cache(cache_key, result):
+            return None
+
+        async def fake_check_model_available(model):
+            return True
+
+        async def fake_generate(**kwargs):
+            raise RuntimeError(
+                "OpenAI-compatible multimodal request was rejected by the provider "
+                "after removing the system role; this backend likely does not accept "
+                "the current image chat payload for this model."
+            )
+
+        async def fake_predict_from_base64(image_base64):
+            return {
+                "classifier_type": "moe_classifier",
+                "checkpoint_path": "remote-score-endpoint",
+                "medsiglip_model_id": "google/medsiglip-448",
+                "classes": ["NORM", "MI", "STTC", "CD", "HYP"],
+                "scores": [0.1, 0.82, 0.18, 0.06, 0.04],
+                "scores_by_class": {
+                    "NORM": 0.1,
+                    "MI": 0.82,
+                    "STTC": 0.18,
+                    "CD": 0.06,
+                    "HYP": 0.04,
+                },
+                "probabilities": [0.18, 0.82, 0.24, 0.11, 0.09],
+                "probabilities_by_class": {
+                    "NORM": 0.18,
+                    "MI": 0.82,
+                    "STTC": 0.24,
+                    "CD": 0.11,
+                    "HYP": 0.09,
+                },
+                "predictions": [0, 1, 0, 0, 0],
+                "predictions_by_class": {
+                    "NORM": 0,
+                    "MI": 1,
+                    "STTC": 0,
+                    "CD": 0,
+                    "HYP": 0,
+                },
+                "predicted_labels": ["MI"],
+                "threshold": 0.5,
+                "gate_weights": [0.1, 0.7, 0.1, 0.05, 0.05],
+                "num_experts": 5,
+            }
+
+        monkeypatch.setattr(llm_module, "_get_cached_upload_analysis", fake_get_cached_upload_analysis)
+        monkeypatch.setattr(llm_module, "_store_upload_analysis_cache", fake_store_upload_analysis_cache)
+        monkeypatch.setattr(llm_module.llm_client, "check_model_available", fake_check_model_available)
+        monkeypatch.setattr(llm_module.llm_client, "generate", fake_generate)
+        monkeypatch.setattr(llm_module.llm_client, "unload", fake_check_model_available)
+        monkeypatch.setattr(llm_module.ecg_classifier_service, "predict_from_base64", fake_predict_from_base64)
+
+        result = await llm_module.analyze_uploaded_record(
+            record_type="ecg",
+            title="ECG",
+            extracted_text=None,
+            image_base64="ZmFrZS1pbWFnZQ==",
+        )
+
+        assert result["status"] == "completed"
+        assert "Bộ phân loại ECG" in result["summary"]
+        assert result["urgency"] == "high"
+        assert result["prediction_scores"][1]["class"] == "MI"
+        assert result["ecg_classifier"]["predicted_labels"] == ["MI"]
+        assert "LLM returned invalid structured output." not in result["limitations"]
+        assert any("dựng từ điểm bộ phân loại" in item for item in result["limitations"])
+
+    @pytest.mark.asyncio
+    async def test_medical_reasoning_skips_images_when_route_disabled(self, monkeypatch):
+        from app.services import llm as llm_module
+
+        calls = []
+
+        async def fake_generate(**kwargs):
+            calls.append(kwargs)
+            return "Medical response"
+
+        monkeypatch.setattr(llm_module.llm_client, "generate", fake_generate)
+        monkeypatch.setattr(llm_module.settings, "enable_multimodal_medical_reasoning", False, raising=False)
+
+        result = await llm_module.medical_reasoning(
+            query_en="Summarize the attached image.",
+            patient_context="Patient has hypertension.",
+            image_base64="ZmFrZS1pbWFnZQ==",
+        )
+
+        assert result == "Medical response"
+        assert len(calls) == 1
+        assert calls[0]["images"] is None
+        assert "Image analysis was skipped" in calls[0]["prompt"]

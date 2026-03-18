@@ -83,6 +83,15 @@ def _resolve_upload_analysis_model(*, has_image: bool) -> str:
     return settings.medical_model
 
 
+def _multimodal_route_capability(*, route_name: str, model: str) -> tuple[bool, str]:
+    """Return whether a route is allowed to send images to the configured LLM path."""
+    if route_name == "upload_analysis" and not settings.enable_multimodal_upload_analysis:
+        return False, "Upload analysis multimodal requests are disabled by configuration."
+    if route_name == "medical_reasoning" and not settings.enable_multimodal_medical_reasoning:
+        return False, "Medical reasoning multimodal requests are disabled by configuration."
+    return llm_client.can_use_images(model)
+
+
 def _strip_markdown_code_fence(raw_text: str) -> str:
     text = str(raw_text or "").strip()
     if not text:
@@ -1226,26 +1235,71 @@ Rules:
 - Do not include markdown fences.
 """
 
-    logger.info("[upload-analysis][ecg] medgemma call start id=%s", request_id)
-    start_llm = time.perf_counter()
-    raw = await llm_client.generate(
+    parsed: Optional[dict[str, Any]] = None
+    raw = ""
+    repaired: dict[str, Any]
+    multimodal_enabled, multimodal_reason = _multimodal_route_capability(
+        route_name="upload_analysis",
         model=analysis_model,
-        prompt=prompt,
-        system=UPLOAD_ANALYSIS_SYSTEM,
-        images=[image_base64],
-        stream=False,
-        num_predict=768,
     )
-    llm_elapsed_ms = (time.perf_counter() - start_llm) * 1000
-    logger.info(
-        "[upload-analysis][ecg] medgemma call done id=%s response_len=%s elapsed_ms=%.1f",
-        request_id,
-        len(raw or ""),
-        llm_elapsed_ms,
-    )
-
-    parsed = _extract_json_object(raw)
-    repaired = _repair_upload_analysis_payload(parsed, raw or "")
+    if not multimodal_enabled:
+        logger.warning(
+            "[upload-analysis][ecg] multimodal skipped id=%s provider=%s model=%s reason=%s; using classifier-only fallback",
+            request_id,
+            settings.llm_provider,
+            analysis_model,
+            multimodal_reason,
+        )
+        repaired = _build_ecg_classifier_fallback_analysis(
+            prediction_scores=ui_prediction_score_rows,
+            predicted_labels=[
+                str(item) for item in (classifier_output.get("predicted_labels") or [])
+            ],
+            reason=(
+                "Đã bỏ qua phân tích ảnh từ LLM vì tuyến model hiện tại không cho phép ảnh; "
+                "phần diễn giải này được dựng từ điểm bộ phân loại."
+            ),
+        )
+    else:
+        logger.info("[upload-analysis][ecg] medgemma call start id=%s", request_id)
+        start_llm = time.perf_counter()
+        try:
+            raw = await llm_client.generate(
+                model=analysis_model,
+                prompt=prompt,
+                system=UPLOAD_ANALYSIS_SYSTEM,
+                images=[image_base64],
+                stream=False,
+                num_predict=768,
+            )
+            llm_elapsed_ms = (time.perf_counter() - start_llm) * 1000
+            logger.info(
+                "[upload-analysis][ecg] medgemma call done id=%s response_len=%s elapsed_ms=%.1f",
+                request_id,
+                len(raw or ""),
+                llm_elapsed_ms,
+            )
+            parsed = _extract_json_object(raw)
+            repaired = _repair_upload_analysis_payload(parsed, raw or "")
+        except Exception as exc:
+            llm_elapsed_ms = (time.perf_counter() - start_llm) * 1000
+            diagnostic = _classify_llm_error(str(exc) or repr(exc))
+            logger.exception(
+                "[upload-analysis][ecg] medgemma call failed id=%s error=%s elapsed_ms=%.1f; using classifier-only fallback",
+                request_id,
+                diagnostic,
+                llm_elapsed_ms,
+            )
+            repaired = _build_ecg_classifier_fallback_analysis(
+                prediction_scores=ui_prediction_score_rows,
+                predicted_labels=[
+                    str(item) for item in (classifier_output.get("predicted_labels") or [])
+                ],
+                reason=(
+                    "Mô hình phân tích ảnh ECG không phản hồi hợp lệ; "
+                    "phần diễn giải này được dựng từ điểm bộ phân loại."
+                ),
+            )
     if _looks_like_low_quality_ecg_output(repaired, raw or ""):
         logger.warning(
             "[upload-analysis][ecg] low-quality llm output id=%s preview=%s",
@@ -1473,7 +1527,14 @@ Rules:
         raw = ""
         multimodal_error: Optional[str] = None
 
+        multimodal_enabled = False
         if images:
+            multimodal_enabled, multimodal_reason = _multimodal_route_capability(
+                route_name="upload_analysis",
+                model=analysis_model,
+            )
+
+        if images and multimodal_enabled:
             try:
                 raw = await llm_client.generate(
                     model=analysis_model,
@@ -1497,6 +1558,15 @@ Rules:
                     analysis_model,
                     len(image_base64 or ""),
                 )
+        elif images:
+            multimodal_error = _sanitize_text(multimodal_reason, max_len=500)
+            logger.warning(
+                "[upload-analysis] multimodal skipped id=%s provider=%s model=%s reason=%s",
+                request_id,
+                settings.llm_provider,
+                analysis_model,
+                multimodal_error,
+            )
         else:
             raw = await llm_client.generate(
                 model=analysis_model,
@@ -1513,7 +1583,8 @@ Rules:
             )
 
         # Retry text-only if multimodal call returned empty/garbled payload.
-        if not raw or len(raw.strip()) < 10:
+        should_retry_text_only = bool(extracted) or not images
+        if (not raw or len(raw.strip()) < 10) and should_retry_text_only:
             logger.warning(
                 "[upload-analysis] retrying text-only id=%s reason=%s",
                 request_id,
@@ -1533,6 +1604,25 @@ Rules:
                 len(raw or ""),
             )
 
+        if images and not raw and not extracted:
+            limitations = []
+            if ecg_fallback_reason:
+                limitations.append("ECG classifier path failed, used default upload analysis flow.")
+            if multimodal_error:
+                limitations.append(f"Image analysis unavailable: {multimodal_error}")
+            limitations.append("No OCR text was available for text-only fallback.")
+            return _validated_upload_analysis_result(
+                {
+                    **base_result,
+                    "status": "error",
+                    "summary": "Không thể tạo AI analysis cho ảnh này với cấu hình hiện tại.",
+                    "key_findings": [],
+                    "recommended_follow_up": [],
+                    "limitations": _sanitize_list(limitations, max_items=6, max_item_len=500),
+                },
+                fallback_message="Không thể tạo AI analysis cho ảnh này với cấu hình hiện tại.",
+            )
+
         parsed = _extract_json_object(raw)
         repaired = _repair_upload_analysis_payload(parsed, raw or "")
         if not _repaired_payload_has_meaningful_content(repaired):
@@ -1540,7 +1630,7 @@ Rules:
             if ecg_fallback_reason:
                 limitations.append("ECG classifier path failed, used default upload analysis flow.")
             if multimodal_error:
-                limitations.append("Image analysis fallback was used due to multimodal request failure.")
+                limitations.append(f"Image analysis fallback was used: {multimodal_error}")
 
             logger.warning(
                 "[upload-analysis] invalid structured output id=%s preview=%s",
@@ -1596,7 +1686,7 @@ Rules:
         if multimodal_error:
             result["limitations"] = _sanitize_list(
                 (result.get("limitations") or []) + [
-                    "Image analysis fallback was used due to multimodal request failure.",
+                    f"Image analysis fallback was used: {multimodal_error}",
                 ],
                 max_items=6,
                 max_item_len=500,
@@ -1684,10 +1774,28 @@ async def medical_reasoning(
 Please provide a helpful, accurate medical response based on the patient's context."""
 
     images = [image_base64] if image_base64 else None
-    
+    prompt_suffix = ""
+    if images:
+        multimodal_enabled, multimodal_reason = _multimodal_route_capability(
+            route_name="medical_reasoning",
+            model=settings.medical_model,
+        )
+        if not multimodal_enabled:
+            logger.warning(
+                "[medical-reasoning] multimodal skipped provider=%s model=%s reason=%s",
+                settings.llm_provider,
+                settings.medical_model,
+                multimodal_reason,
+            )
+            images = None
+            prompt_suffix = (
+                "\n\nNote: Image analysis was skipped because the configured LLM route "
+                "is not enabled for images."
+            )
+
     response = await llm_client.generate(
         model=settings.medical_model,
-        prompt=prompt,
+        prompt=f"{prompt}{prompt_suffix}",
         system=MEDICAL_REASONING_SYSTEM,
         images=images,
         stream=False
@@ -2022,6 +2130,15 @@ async def check_system_health() -> dict:
     """
     llm_ok = await llm_client.health_check()
     provider = (settings.llm_provider or "vertex").lower()
+    upload_analysis_model = _resolve_upload_analysis_model(has_image=True)
+    upload_images_enabled, upload_images_reason = _multimodal_route_capability(
+        route_name="upload_analysis",
+        model=upload_analysis_model,
+    )
+    medical_reasoning_images_enabled, medical_reasoning_images_reason = _multimodal_route_capability(
+        route_name="medical_reasoning",
+        model=settings.medical_model,
+    )
 
     if not llm_ok:
         return {
@@ -2029,11 +2146,26 @@ async def check_system_health() -> dict:
             "provider": provider,
             "llm": False,
             "message": f"{provider} provider is not reachable",
+            "capabilities": {
+                "upload_analysis_images": {
+                    "enabled": upload_images_enabled,
+                    "model": upload_analysis_model,
+                    "reason": upload_images_reason,
+                },
+                "medical_reasoning_images": {
+                    "enabled": medical_reasoning_images_enabled,
+                    "model": settings.medical_model,
+                    "reason": medical_reasoning_images_reason,
+                },
+            },
         }
     
     models_status = {
         "medical_model": await llm_client.check_model_available(
             settings.medical_model
+        ),
+        "upload_analysis_model": await llm_client.check_model_available(
+            upload_analysis_model
         ),
         "embedding_model": await llm_client.check_model_available(
             settings.embedding_model
@@ -2047,5 +2179,17 @@ async def check_system_health() -> dict:
         "provider": provider,
         "llm": True,
         "models": models_status,
+        "capabilities": {
+            "upload_analysis_images": {
+                "enabled": upload_images_enabled,
+                "model": upload_analysis_model,
+                "reason": upload_images_reason,
+            },
+            "medical_reasoning_images": {
+                "enabled": medical_reasoning_images_enabled,
+                "model": settings.medical_model,
+                "reason": medical_reasoning_images_reason,
+            },
+        },
         "message": "All systems operational" if all_available else "Some models missing"
     }

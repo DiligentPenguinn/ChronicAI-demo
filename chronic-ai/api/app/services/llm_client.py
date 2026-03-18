@@ -57,6 +57,51 @@ class LLMClient:
         self._access_token: Optional[str] = None
         self._token_expires_at: float = 0.0
 
+    def _current_provider(self) -> str:
+        return (settings.llm_provider or self._provider or "vertex").strip().lower()
+
+    @staticmethod
+    def _normalized_image_model_allowlist() -> set[str]:
+        return {
+            str(model).strip().lower()
+            for model in (settings.openai_compatible_image_models or [])
+            if str(model).strip()
+        }
+
+    def can_use_images(self, model: Optional[str] = None) -> tuple[bool, str]:
+        """
+        Return whether the configured provider/model is explicitly allowed for images.
+
+        For OpenAI-compatible providers we require an allowlist because gateway/model
+        behavior varies by backend. Vertex and Ollama keep existing permissive behavior.
+        """
+        provider = self._current_provider()
+        if provider == "ollama" or not is_openai_compatible_provider(provider):
+            return True, ""
+
+        effective_model = (
+            (model or "").strip()
+            or (settings.openai_compatible_model or "").strip()
+            or (settings.medical_model or "").strip()
+        )
+        if not effective_model:
+            return False, "No OpenAI-compatible model is configured for image requests."
+
+        allowlist = self._normalized_image_model_allowlist()
+        if not allowlist:
+            return False, (
+                "No OpenAI-compatible image models are allowlisted. "
+                "Set OPENAI_COMPATIBLE_IMAGE_MODELS to enable image requests."
+            )
+
+        if effective_model.lower() not in allowlist:
+            return False, (
+                f"Model '{effective_model}' is not configured as an allowed "
+                "OpenAI-compatible image model."
+            )
+
+        return True, ""
+
     async def generate(
         self,
         model: str,
@@ -77,7 +122,9 @@ class LLMClient:
             stream: Stream output if True
             num_predict: Max generated tokens
         """
-        if self._provider == "ollama":
+        provider = self._current_provider()
+
+        if provider == "ollama":
             return await self._generate_ollama(
                 model=model,
                 prompt=prompt,
@@ -87,7 +134,7 @@ class LLMClient:
                 num_predict=num_predict,
             )
 
-        if is_openai_compatible_provider(self._provider):
+        if is_openai_compatible_provider(provider):
             if stream:
                 return self._stream_openai_compatible_response(
                     model=model,
@@ -175,6 +222,14 @@ class LLMClient:
                                         headers=headers,
                                         json=fallback_payload,
                                     )
+                                    if response.status_code >= 400:
+                                        fallback_error_text = self._extract_http_error(response)
+                                        if images and self._is_role_alternation_error(fallback_error_text):
+                                            raise RuntimeError(
+                                                "OpenAI-compatible multimodal request was rejected by the provider "
+                                                "after removing the system role; this backend likely does not accept "
+                                                "the current image chat payload for this model."
+                                            )
                                 response.raise_for_status()
                             return self._extract_vertex_text(response.json())
                         except (httpx.TimeoutException, httpx.RemoteProtocolError, httpx.ReadError) as e:
@@ -1375,7 +1430,7 @@ class LLMClient:
 
         Vertex mode does not support pull and simply checks configured availability.
         """
-        if self._provider != "ollama":
+        if self._current_provider() != "ollama":
             return await self.check_model_available(model)
 
         try:
@@ -1404,7 +1459,7 @@ class LLMClient:
 
     async def ensure_model_available(self, model: str) -> bool:
         """Ensure a model is available locally, pulling it if needed."""
-        if self._provider != "ollama":
+        if self._current_provider() != "ollama":
             return await self.check_model_available(model)
 
         if await self.check_model_available(model):
@@ -1418,6 +1473,8 @@ class LLMClient:
 
     async def check_model_available(self, model: str) -> bool:
         """Check if a model is available."""
+        provider = self._current_provider()
+
         if model == settings.embedding_model:
             if self._embedding_provider == "hash":
                 return True
@@ -1441,7 +1498,7 @@ class LLMClient:
                 except Exception:
                     return False
 
-        if is_openai_compatible_provider(self._provider):
+        if is_openai_compatible_provider(provider):
             requested_model = (model or "").strip()
             configured_model = (settings.openai_compatible_model or settings.medical_model or "").strip()
             effective_model = requested_model or configured_model
@@ -1454,7 +1511,7 @@ class LLMClient:
                 )
             return base_url and bool(effective_model)
 
-        if self._provider != "ollama":
+        if provider != "ollama":
             project = bool((settings.vertex_ai_project_id or "").strip())
             location = bool((settings.vertex_ai_location or "").strip())
             endpoint_id = bool((settings.vertex_ai_endpoint_id or "").strip())
@@ -1480,7 +1537,9 @@ class LLMClient:
         if not await self.check_model_available(settings.medical_model):
             return False
 
-        if self._provider == "ollama":
+        provider = self._current_provider()
+
+        if provider == "ollama":
             try:
                 async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as client:
                     response = await client.get(f"{self.host}/api/tags")
@@ -1489,7 +1548,7 @@ class LLMClient:
                 return False
 
         try:
-            if is_openai_compatible_provider(self._provider):
+            if is_openai_compatible_provider(provider):
                 _ = await self._generate_openai_compatible(
                     model=settings.medical_model,
                     prompt="Reply with: ok",
@@ -1508,7 +1567,7 @@ class LLMClient:
             )
             return True
         except Exception as e:
-            logger.warning("%s health check failed: %s", self._provider, e)
+            logger.warning("%s health check failed: %s", provider, e)
             return False
 
 
