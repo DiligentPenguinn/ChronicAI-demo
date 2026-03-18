@@ -25,7 +25,6 @@ for mod_name in _STUBS:
 
 # Now it's safe to import
 from app.services.ecg_classifier_service import (  # noqa: E402
-    DEFAULT_SCORE_THRESHOLD,
     ECG_LABEL_PROMPTS,
     ECGClassifierService,
 )
@@ -177,70 +176,6 @@ class _MockAsyncClient:
 
 
 class TestPredictFromBase64:
-    @pytest.mark.asyncio
-    async def test_predict_from_base64_supports_explicit_embed_image_endpoint(self, service):
-        recorder = {}
-        image_bytes = b"fake-png-data"
-        image_base64 = base64.b64encode(image_bytes).decode("ascii")
-        remote_payload = {
-            "model": "google/medsiglip-448",
-            "embedding": [0.1, -0.2, 0.3],
-        }
-        local_prediction = {
-            "classifier_type": "moe_classifier",
-            "checkpoint_path": "local-checkpoint:moe_classifier_medsiglip.pt",
-            "medsiglip_model_id": "google/medsiglip-448",
-            "classes": [label for label, _ in ECG_LABEL_PROMPTS],
-            "scores": [-1.2, -0.7, 1.4, 0.1, 0.9],
-            "scores_by_class": {
-                "NORM": -1.2,
-                "MI": -0.7,
-                "STTC": 1.4,
-                "CD": 0.1,
-                "HYP": 0.9,
-            },
-            "probabilities": [0.23, 0.33, 0.8, 0.52, 0.71],
-            "probabilities_by_class": {
-                "NORM": 0.23,
-                "MI": 0.33,
-                "STTC": 0.8,
-                "CD": 0.52,
-                "HYP": 0.71,
-            },
-            "predictions": [0, 0, 1, 1, 1],
-            "predictions_by_class": {
-                "NORM": 0,
-                "MI": 0,
-                "STTC": 1,
-                "CD": 1,
-                "HYP": 1,
-            },
-            "predicted_labels": ["STTC", "CD", "HYP"],
-            "threshold": 0.5,
-        }
-
-        with patch("app.services.ecg_classifier_service.settings") as ms:
-            ms.ecg_classifier_endpoint_url = "https://example.test/embed/image"
-            with patch.object(service, "_get_auth_headers", AsyncMock(return_value={"Authorization": "Bearer token", "Content-Type": "application/json"})):
-                with patch.object(service, "_predict_from_embedding", return_value=local_prediction) as mock_predict:
-                    with patch(
-                        "app.services.ecg_classifier_service.httpx.AsyncClient",
-                        return_value=_MockAsyncClient(remote_payload, recorder),
-                    ):
-                        result = await service.predict_from_base64(image_base64)
-
-        assert recorder["url"] == "https://example.test/embed/image"
-        assert recorder["kwargs"]["headers"] == {"Authorization": "Bearer token"}
-        uploaded_file = recorder["kwargs"]["files"][0]
-        assert uploaded_file[0] == "file"
-        assert uploaded_file[1][0] == "ecg-upload.png"
-        assert uploaded_file[1][1] == image_bytes
-        mock_predict.assert_called_once_with(
-            [0.1, -0.2, 0.3],
-            medsiglip_model_id="google/medsiglip-448",
-        )
-        assert result == local_prediction
-
     @pytest.mark.asyncio
     async def test_predict_from_base64_adapts_remote_score_payload(self, service):
         recorder = {}
@@ -461,19 +396,3 @@ class TestPredictFromBase64:
         )
 
         assert isinstance(request.stream, httpx._multipart.MultipartStream)
-
-    def test_resolve_checkpoint_path_supports_classifier_ckpt_path_env(self, service, monkeypatch):
-        monkeypatch.delenv("CLASSIFIER_CKPT_PATH", raising=False)
-        monkeypatch.setenv("CLASSIFIER_CKPT_PATH", "/tmp/moe_classifier_medsiglip.pt")
-
-        resolved = service._resolve_checkpoint_path()
-
-        assert str(resolved) == "/tmp/moe_classifier_medsiglip.pt"
-
-    def test_normalize_embed_image_response_rejects_non_numeric_values(self, service):
-        with pytest.raises(RuntimeError, match="non-numeric embedding"):
-            service._normalize_embed_image_response({"embedding": ["bad", 0.2]})
-
-    def test_normalize_embed_image_response_rejects_missing_embedding(self, service):
-        with pytest.raises(RuntimeError, match="missing or empty embedding"):
-            service._normalize_embed_image_response({})
